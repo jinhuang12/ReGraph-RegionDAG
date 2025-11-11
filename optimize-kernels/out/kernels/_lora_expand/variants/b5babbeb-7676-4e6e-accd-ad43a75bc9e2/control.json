@@ -1,0 +1,347 @@
+{
+  "base_source_code": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,\n         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n         EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,\n         b_dtype: tl.constexpr):\n    \"\"\"\n    Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of\n    B (k x n), iterate, through the K dimension to compute the partial/complete\n    matrix block product.\n    If SPLIT_K == 1, the output m x n product is complete.\n    If SPLIT_K > 1, the thread block computes partial outputs. The partial\n    outputs are then atomically summed in the caller code. \n    Args:\n        a_ptr: Array of pointers, identifying rows of A \n        b_ptr: Array of pointers, identifying columns of B\n        ak_stride: K dimension stride of the A matrix\n        bk_stride: K dimension stride of the B matrix\n        K: Length of the K dimension\n        BLOCK_M: M dimension of the output block m x n\n        BLOCK_N: N dimension of the output block m x n\n        BLOCK_K: K dimension atom\n        EVEN_K: True if the blocks of A and B can be loaded without any\n          masking.\n        SPLIT_K: Parameter signifying parallelism in the K dimension. \n        CAST_TYPE: if True, cast the values from the A matrix to the B\n          matrix dtype.\n        b_dtype: datatype of the B matrix\n    \"\"\"\n    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for k in range(tl.cdiv(K, BLOCK_K * SPLIT_K)):\n        if EVEN_K:\n            tiled_a = tl.load(a_ptr)\n            tiled_b = tl.load(b_ptr)\n        else:\n            tiled_a = tl.load(a_ptr,\n                              mask=offset_k[None, :]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n            tiled_b = tl.load(b_ptr,\n                              mask=offset_k[:, None]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n        if CAST_TYPE:\n            tiled_a = tiled_a.to(b_dtype)\n        accumulator += tl.dot(\n            tiled_a,\n            tiled_b,\n        )\n        a_ptr += BLOCK_K * SPLIT_K * ak_stride\n        b_ptr += BLOCK_K * SPLIT_K * bk_stride\n    return accumulator\n\n\n\n@triton.jit\ndef do_expand_kernel(\n    pid_n,\n    lora_index,\n    slice_id,\n    input_ptr,\n    lora_ptr,\n    out_ptr,\n    N,\n    K,\n    M_LEN,\n    ram,  # array identifying the rows of Input ptr to operate on\n    slice_start_loc,\n    # input ptr strides\n    input_d0_stride,\n    input_d1_stride,\n    input_d2_stride,\n    # lora ptr strides\n    ls_d0_ptr,\n    ls_d1_ptr,\n    ls_d2_ptr,\n    # out ptr strides\n    output_d0_stride,\n    output_d1_stride,\n    # constants\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n    BLOCK_K: tl.constexpr,\n    SAME_STRIDE: tl.constexpr,\n    SLICE_NUM: tl.constexpr,\n    EVEN_K: tl.constexpr,\n    CAST_TYPE: tl.constexpr,\n    ADD_INPUTS: tl.constexpr,\n):\n    \"\"\"\n    Given an array of integers that identifies the rows of A, ram,\n    a lora index that identifies which LoRA to use from lora_ptr, lora_index,\n    a slice_id that identifies the input/output slice,\n    compute the matrix product and store in the appropriate output location.\n    Given that this is an expand kernel, we don't perform any split-K reduction\n    as the K dimension is assumed to be small.\n    \"\"\"\n\n    # ls_d*_ptr can be either an integer or a pointer\n    if SAME_STRIDE:\n        # integer\n        cur_lora_d0_stride = ls_d0_ptr\n        cur_lora_d1_stride = ls_d1_ptr\n        cur_lora_d2_stride = ls_d2_ptr\n    else:\n        # pointer\n        cur_lora_d0_stride = tl.load(ls_d0_ptr + slice_id)\n        cur_lora_d1_stride = tl.load(ls_d1_ptr + slice_id)\n        cur_lora_d2_stride = tl.load(ls_d2_ptr + slice_id)\n\n    # Identify the input_ptr and lora_ptr from slice_id.\n    if SLICE_NUM == 1:\n        cur_input_ptr = input_ptr\n        cur_lora_ptr = lora_ptr\n    else:\n        cur_input_ptr = input_ptr + slice_id * input_d0_stride\n        cur_lora_ptr = tl.load(lora_ptr + slice_id).to(\n            tl.pointer_type(out_ptr.dtype.element_ty))\n\n    # Identify the column indices of B to process.\n    offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N\n    rbn = tl.max_contiguous(tl.multiple_of(offset_n % N, BLOCK_N), BLOCK_N)\n\n    # Identify A and B block pointers\n    offset_k = tl.arange(0, BLOCK_K)\n    a_ptr = (cur_input_ptr + ram[:, None] * input_d1_stride +\n             offset_k[None, :] * input_d2_stride)\n    b_ptr = (cur_lora_ptr + cur_lora_d0_stride * lora_index +\n             offset_k[:, None] * cur_lora_d2_stride +\n             rbn[None, :] * cur_lora_d1_stride)\n\n    # Compute the block matrix product.\n    SPLIT_K = 1\n    accumulator = mm_k(a_ptr, b_ptr, input_d2_stride, cur_lora_d2_stride,\n                       offset_k, K, BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, SPLIT_K,\n                       CAST_TYPE, cur_lora_ptr.dtype.element_ty)\n\n    tiled_c = accumulator.to(cur_lora_ptr.dtype.element_ty)\n    if SLICE_NUM == 1:\n        cur_slice_start = slice_start_loc\n    else:\n        cur_slice_start = tl.load(slice_start_loc + slice_id)\n\n    # Identify the C output pointers to store the results of the accumulator.\n    offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + cur_slice_start\n    offset_cm = tl.arange(0, BLOCK_M)\n    c_ptr = (out_ptr + ram[:, None] * output_d0_stride +\n             offset_cn[None, :] * output_d1_stride)\n    c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :]\n                                             < (cur_slice_start + N))\n\n    if ADD_INPUTS:\n        tiled_out = tl.load(c_ptr, mask=c_mask)\n        tiled_c += tiled_out\n    tl.store(c_ptr, tiled_c, mask=c_mask)\n\n@triton.jit\ndef _lora_expand_kernel(\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        M,\n        N,\n        K,\n        token_indices_sorted_by_lora_ids,\n        num_tokens_per_lora,\n        lora_token_start_loc,\n        lora_ids,\n        slice_start_loc,\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,  # 1\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,  # 1\n        output_d0_stride,\n        output_d1_stride,  # 1\n        output_hs_ptr,\n        BLOCK_M: tl.constexpr,\n        BLOCK_N: tl.constexpr,\n        BLOCK_K: tl.constexpr,\n        EVEN_K: tl.constexpr,\n        ADD_INPUTS: tl.constexpr,\n        CAST_TYPE: tl.constexpr,\n        SLICE_NUM: tl.constexpr,\n        SAME_STRIDE: tl.constexpr):\n\n    cta_n_num = tl.cdiv(N, BLOCK_N)\n    # M is the maximum token count owned by any LoRA; it bounds CTA rows.\n    cta_m_num = tl.cdiv(M, BLOCK_M)\n\n    pid_mn = tl.program_id(axis=0)\n    pid_m = pid_mn % cta_m_num\n    pid_n = (pid_mn // cta_m_num) % cta_n_num\n\n    slice_id = tl.program_id(axis=1)\n    lora_idx = tl.program_id(axis=2)\n\n    lora_id = tl.load(lora_ids + lora_idx)\n    if lora_id == -1:\n        # Early exit for the no-lora case.\n        return\n\n    lora_m_size = tl.load(num_tokens_per_lora + lora_idx)\n\n    cta_m_offset = pid_m * BLOCK_M\n    if cta_m_offset >= lora_m_size:\n        # Early exit CTA.\n        return\n\n    # When the output dimensions of each slice are the same,cur_n=N, otherwise\n    # cur_n=tl.load(output_hs_ptr + slice_id), this situation exists in GQA's\n    # qkv linear.\n    curr_N = N if SAME_STRIDE else tl.load(output_hs_ptr + slice_id)\n    if pid_n * BLOCK_N >= curr_N:\n        # Early exit CTA.\n        return\n\n    # num rows this CTA should process.\n    cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)\n\n    # Identify all rows that this CTA should process.\n    lora_m_indices_start = tl.load(lora_token_start_loc + lora_idx)\n    cta_lora_seq_indices = (token_indices_sorted_by_lora_ids +\n                            lora_m_indices_start + cta_m_offset)\n\n    # Load all relevant row indices.\n    offset_m = tl.arange(0, BLOCK_M) % cta_m_len\n    ram = tl.load(cta_lora_seq_indices + offset_m)\n\n    do_expand_kernel(\n        pid_n,\n        lora_id,\n        slice_id,\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        curr_N,\n        K,\n        cta_m_len,\n        ram,  # array identifying the rows of Input ptr to operate on\n        slice_start_loc,\n        # input ptr strides\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,\n        # lora ptr strides\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,\n        # out ptr strides\n        output_d0_stride,\n        output_d1_stride,\n        # constants\n        BLOCK_M,\n        BLOCK_N,\n        BLOCK_K,\n        SAME_STRIDE,\n        SLICE_NUM,\n        EVEN_K,\n        CAST_TYPE,\n        ADD_INPUTS)",
+  "kernel": {
+    "device_profile": {
+      "arch": "sm_90a",
+      "gpu_name": "NVIDIA H200",
+      "hbm_bw_gbps": 4800,
+      "regs_per_sm": 65536,
+      "smem_per_sm": 228000,
+      "sms": 132
+    },
+    "io": {
+      "args": [
+        {
+          "is_meta": false,
+          "name": "input_ptr",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            },
+            "shape": [
+              1,
+              8192,
+              32
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "lora_ptr",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "seed": 43
+            },
+            "shape": [
+              16,
+              5120,
+              32
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "out_ptr",
+          "role": "output",
+          "tensor_spec": {
+            "dtype": "float16",
+            "shape": [
+              8192,
+              5120
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "M",
+          "role": "input",
+          "type": "int",
+          "value": 8192
+        },
+        {
+          "is_meta": false,
+          "name": "N",
+          "role": "input",
+          "type": "int",
+          "value": 5120
+        },
+        {
+          "is_meta": false,
+          "name": "K",
+          "role": "input",
+          "type": "int",
+          "value": 32
+        },
+        {
+          "is_meta": false,
+          "name": "token_indices_sorted_by_lora_ids",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "int32",
+            "init": {
+              "kind": "arange",
+              "seed": 44,
+              "start": 0.0,
+              "step": 1.0
+            },
+            "shape": [
+              8192
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "num_tokens_per_lora",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "int32",
+            "init": {
+              "fill_value": 512.0,
+              "kind": "full",
+              "seed": 45
+            },
+            "shape": [
+              17
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "lora_token_start_loc",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "int32",
+            "init": {
+              "kind": "arange",
+              "seed": 46,
+              "start": 0.0,
+              "step": 512.0
+            },
+            "shape": [
+              18
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "lora_ids",
+          "role": "input",
+          "tensor_spec": {
+            "dtype": "int32",
+            "init": {
+              "kind": "arange",
+              "seed": 47,
+              "start": 0.0,
+              "step": 1.0
+            },
+            "shape": [
+              17
+            ]
+          },
+          "type": "tensor"
+        },
+        {
+          "is_meta": false,
+          "name": "slice_start_loc",
+          "role": "input",
+          "type": "int",
+          "value": 0
+        },
+        {
+          "is_meta": false,
+          "name": "input_d0_stride",
+          "role": "input",
+          "type": "int",
+          "value": 262144
+        },
+        {
+          "is_meta": false,
+          "name": "input_d1_stride",
+          "role": "input",
+          "type": "int",
+          "value": 32
+        },
+        {
+          "is_meta": false,
+          "name": "input_d2_stride",
+          "role": "input",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "is_meta": false,
+          "name": "ls_d0_ptr",
+          "role": "input",
+          "type": "int",
+          "value": 163840
+        },
+        {
+          "is_meta": false,
+          "name": "ls_d1_ptr",
+          "role": "input",
+          "type": "int",
+          "value": 32
+        },
+        {
+          "is_meta": false,
+          "name": "ls_d2_ptr",
+          "role": "input",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "is_meta": false,
+          "name": "output_d0_stride",
+          "role": "input",
+          "type": "int",
+          "value": 5120
+        },
+        {
+          "is_meta": false,
+          "name": "output_d1_stride",
+          "role": "input",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "is_meta": false,
+          "name": "output_hs_ptr",
+          "role": "input",
+          "type": "int",
+          "value": 5120
+        },
+        {
+          "is_meta": true,
+          "name": "BLOCK_M",
+          "role": "input",
+          "type": "int",
+          "value": 16
+        },
+        {
+          "is_meta": true,
+          "name": "BLOCK_N",
+          "role": "input",
+          "type": "int",
+          "value": 64
+        },
+        {
+          "is_meta": true,
+          "name": "BLOCK_K",
+          "role": "input",
+          "type": "int",
+          "value": 32
+        },
+        {
+          "is_meta": true,
+          "name": "EVEN_K",
+          "role": "input",
+          "type": "bool",
+          "value": true
+        },
+        {
+          "is_meta": true,
+          "name": "ADD_INPUTS",
+          "role": "input",
+          "type": "bool",
+          "value": false
+        },
+        {
+          "is_meta": true,
+          "name": "CAST_TYPE",
+          "role": "input",
+          "type": "bool",
+          "value": true
+        },
+        {
+          "is_meta": true,
+          "name": "SLICE_NUM",
+          "role": "input",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "is_meta": true,
+          "name": "SAME_STRIDE",
+          "role": "input",
+          "type": "bool",
+          "value": true
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 40960,
+          "y": 1,
+          "z": 17
+        },
+        "num_stages": 2,
+        "num_warps": 4
+      }
+    },
+    "kernel_type": "triton",
+    "metadata": {
+      "kernel_name": "_lora_expand_kernel"
+    },
+    "name": "_lora_expand",
+    "source_code": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,\n         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n         EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,\n         b_dtype: tl.constexpr):\n    \"\"\"\n    Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of\n    B (k x n), iterate, through the K dimension to compute the partial/complete\n    matrix block product.\n    If SPLIT_K == 1, the output m x n product is complete.\n    If SPLIT_K > 1, the thread block computes partial outputs. The partial\n    outputs are then atomically summed in the caller code. \n    Args:\n        a_ptr: Array of pointers, identifying rows of A \n        b_ptr: Array of pointers, identifying columns of B\n        ak_stride: K dimension stride of the A matrix\n        bk_stride: K dimension stride of the B matrix\n        K: Length of the K dimension\n        BLOCK_M: M dimension of the output block m x n\n        BLOCK_N: N dimension of the output block m x n\n        BLOCK_K: K dimension atom\n        EVEN_K: True if the blocks of A and B can be loaded without any\n          masking.\n        SPLIT_K: Parameter signifying parallelism in the K dimension. \n        CAST_TYPE: if True, cast the values from the A matrix to the B\n          matrix dtype.\n        b_dtype: datatype of the B matrix\n    \"\"\"\n    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for k in range(tl.cdiv(K, BLOCK_K * SPLIT_K)):\n        if EVEN_K:\n            tiled_a = tl.load(a_ptr)\n            tiled_b = tl.load(b_ptr)\n        else:\n            tiled_a = tl.load(a_ptr,\n                              mask=offset_k[None, :]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n            tiled_b = tl.load(b_ptr,\n                              mask=offset_k[:, None]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n        if CAST_TYPE:\n            tiled_a = tiled_a.to(b_dtype)\n        accumulator += tl.dot(\n            tiled_a,\n            tiled_b,\n        )\n        a_ptr += BLOCK_K * SPLIT_K * ak_stride\n        b_ptr += BLOCK_K * SPLIT_K * bk_stride\n    return accumulator\n\n\n\n@triton.jit\ndef do_expand_kernel(\n    pid_n,\n    lora_index,\n    slice_id,\n    input_ptr,\n    lora_ptr,\n    out_ptr,\n    N,\n    K,\n    M_LEN,\n    ram,  # array identifying the rows of Input ptr to operate on\n    slice_start_loc,\n    # input ptr strides\n    input_d0_stride,\n    input_d1_stride,\n    input_d2_stride,\n    # lora ptr strides\n    ls_d0_ptr,\n    ls_d1_ptr,\n    ls_d2_ptr,\n    # out ptr strides\n    output_d0_stride,\n    output_d1_stride,\n    # constants\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n    BLOCK_K: tl.constexpr,\n    SAME_STRIDE: tl.constexpr,\n    SLICE_NUM: tl.constexpr,\n    EVEN_K: tl.constexpr,\n    CAST_TYPE: tl.constexpr,\n    ADD_INPUTS: tl.constexpr,\n):\n    \"\"\"\n    Given an array of integers that identifies the rows of A, ram,\n    a lora index that identifies which LoRA to use from lora_ptr, lora_index,\n    a slice_id that identifies the input/output slice,\n    compute the matrix product and store in the appropriate output location.\n    Given that this is an expand kernel, we don't perform any split-K reduction\n    as the K dimension is assumed to be small.\n    \"\"\"\n\n    # ls_d*_ptr can be either an integer or a pointer\n    if SAME_STRIDE:\n        # integer\n        cur_lora_d0_stride = ls_d0_ptr\n        cur_lora_d1_stride = ls_d1_ptr\n        cur_lora_d2_stride = ls_d2_ptr\n    else:\n        # pointer\n        cur_lora_d0_stride = tl.load(ls_d0_ptr + slice_id)\n        cur_lora_d1_stride = tl.load(ls_d1_ptr + slice_id)\n        cur_lora_d2_stride = tl.load(ls_d2_ptr + slice_id)\n\n    # Identify the input_ptr and lora_ptr from slice_id.\n    if SLICE_NUM == 1:\n        cur_input_ptr = input_ptr\n        cur_lora_ptr = lora_ptr\n    else:\n        cur_input_ptr = input_ptr + slice_id * input_d0_stride\n        cur_lora_ptr = tl.load(lora_ptr + slice_id).to(\n            tl.pointer_type(out_ptr.dtype.element_ty))\n\n    # Identify the column indices of B to process.\n    offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N\n    rbn = tl.max_contiguous(tl.multiple_of(offset_n % N, BLOCK_N), BLOCK_N)\n\n    # Identify A and B block pointers\n    offset_k = tl.arange(0, BLOCK_K)\n    a_ptr = (cur_input_ptr + ram[:, None] * input_d1_stride +\n             offset_k[None, :] * input_d2_stride)\n    b_ptr = (cur_lora_ptr + cur_lora_d0_stride * lora_index +\n             offset_k[:, None] * cur_lora_d2_stride +\n             rbn[None, :] * cur_lora_d1_stride)\n\n    # Compute the block matrix product.\n    SPLIT_K = 1\n    accumulator = mm_k(a_ptr, b_ptr, input_d2_stride, cur_lora_d2_stride,\n                       offset_k, K, BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, SPLIT_K,\n                       CAST_TYPE, cur_lora_ptr.dtype.element_ty)\n\n    tiled_c = accumulator.to(cur_lora_ptr.dtype.element_ty)\n    if SLICE_NUM == 1:\n        cur_slice_start = slice_start_loc\n    else:\n        cur_slice_start = tl.load(slice_start_loc + slice_id)\n\n    # Identify the C output pointers to store the results of the accumulator.\n    offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + cur_slice_start\n    offset_cm = tl.arange(0, BLOCK_M)\n    c_ptr = (out_ptr + ram[:, None] * output_d0_stride +\n             offset_cn[None, :] * output_d1_stride)\n    c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :]\n                                             < (cur_slice_start + N))\n\n    if ADD_INPUTS:\n        tiled_out = tl.load(c_ptr, mask=c_mask)\n        tiled_c += tiled_out\n    tl.store(c_ptr, tiled_c, mask=c_mask)\n\n@triton.jit\ndef _lora_expand_kernel(\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        M,\n        N,\n        K,\n        token_indices_sorted_by_lora_ids,\n        num_tokens_per_lora,\n        lora_token_start_loc,\n        lora_ids,\n        slice_start_loc,\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,  # 1\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,  # 1\n        output_d0_stride,\n        output_d1_stride,  # 1\n        output_hs_ptr,\n        BLOCK_M: tl.constexpr,\n        BLOCK_N: tl.constexpr,\n        BLOCK_K: tl.constexpr,\n        EVEN_K: tl.constexpr,\n        ADD_INPUTS: tl.constexpr,\n        CAST_TYPE: tl.constexpr,\n        SLICE_NUM: tl.constexpr,\n        SAME_STRIDE: tl.constexpr):\n\n    cta_n_num = tl.cdiv(N, BLOCK_N)\n    # M is the maximum token count owned by any LoRA; it bounds CTA rows.\n    cta_m_num = tl.cdiv(M, BLOCK_M)\n\n    pid_mn = tl.program_id(axis=0)\n    pid_m = pid_mn % cta_m_num\n    pid_n = (pid_mn // cta_m_num) % cta_n_num\n\n    slice_id = tl.program_id(axis=1)\n    lora_idx = tl.program_id(axis=2)\n\n    lora_id = tl.load(lora_ids + lora_idx)\n    if lora_id == -1:\n        # Early exit for the no-lora case.\n        return\n\n    lora_m_size = tl.load(num_tokens_per_lora + lora_idx)\n\n    cta_m_offset = pid_m * BLOCK_M\n    if cta_m_offset >= lora_m_size:\n        # Early exit CTA.\n        return\n\n    # When the output dimensions of each slice are the same,cur_n=N, otherwise\n    # cur_n=tl.load(output_hs_ptr + slice_id), this situation exists in GQA's\n    # qkv linear.\n    curr_N = N if SAME_STRIDE else tl.load(output_hs_ptr + slice_id)\n    if pid_n * BLOCK_N >= curr_N:\n        # Early exit CTA.\n        return\n\n    # num rows this CTA should process.\n    cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)\n\n    # Identify all rows that this CTA should process.\n    lora_m_indices_start = tl.load(lora_token_start_loc + lora_idx)\n    cta_lora_seq_indices = (token_indices_sorted_by_lora_ids +\n                            lora_m_indices_start + cta_m_offset)\n\n    # Load all relevant row indices.\n    offset_m = tl.arange(0, BLOCK_M) % cta_m_len\n    ram = tl.load(cta_lora_seq_indices + offset_m)\n\n    do_expand_kernel(\n        pid_n,\n        lora_id,\n        slice_id,\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        curr_N,\n        K,\n        cta_m_len,\n        ram,  # array identifying the rows of Input ptr to operate on\n        slice_start_loc,\n        # input ptr strides\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,\n        # lora ptr strides\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,\n        # out ptr strides\n        output_d0_stride,\n        output_d1_stride,\n        # constants\n        BLOCK_M,\n        BLOCK_N,\n        BLOCK_K,\n        SAME_STRIDE,\n        SLICE_NUM,\n        EVEN_K,\n        CAST_TYPE,\n        ADD_INPUTS)"
+  },
+  "ncu": {
+    "collect": true,
+    "enabled": true
+  },
+  "timing": {
+    "iters": 100,
+    "repeat": 3,
+    "warmup": 10
+  },
+  "variant": {
+    "candidate_id": "d2b8f6e1-4c9a-47f1-8a2d-5b7e9c3f1a6b",
+    "justification": "Profile indicates a gmem-bound region. Enabling a 3-stage async pipeline overlaps global memory transfers with compute, reducing memory stalls and improving throughput with minimal, semantics-preserving changes.",
+    "launch_update": null,
+    "moves": [
+      {
+        "name": "enable_async_pipeline",
+        "params": {
+          "stages": 3
+        }
+      }
+    ],
+    "patch": {
+      "files": [
+        {
+          "diff": "*** a/kernel.py\n+++ b/kernel.py\n@@\n-@triton.jit\n-def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,\n-         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n-         EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,\n-         b_dtype: tl.constexpr):\n+@triton.jit(stages=3)\n+def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,\n+         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n+         EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,\n+         b_dtype: tl.constexpr):\n@@\n-@triton.jit\n-def do_expand_kernel(\n+@triton.jit(stages=3)\n+def do_expand_kernel(\n     pid_n,\n     lora_index,\n     slice_id,\n@@\n-@triton.jit\n-def _lora_expand_kernel(\n+@triton.jit(stages=3)\n+def _lora_expand_kernel(\n         input_ptr,\n         lora_ptr,\n         out_ptr,\n*** End Patch\n",
+          "path": "kernel.py"
+        }
+      ],
+      "format": "unified-diff"
+    },
+    "preconditions_asserted": [
+      "Triton runtime on the target NVIDIA H200 (sm_90a) supports the 'stages' parameter for @triton.jit enabling software pipelining (cp.async/TMA or equivalent).",
+      "Adding stages does not alter memory indexing, control flow, or algorithmic semantics of the kernels.",
+      "Increased register/shared-memory pressure from stages=3 remains within compiler/hardware limits; otherwise compilation may fail or performance may regress."
+    ],
+    "predicted_effect": {
+      "comp_scale": 1.05,
+      "gmem_scale": 0.95,
+      "overlap": true,
+      "timelines_touched": [
+        "gmem",
+        "compute",
+        "overlap"
+      ]
+    },
+    "risk_notes": "Enabling stages may increase register and scheduling pressure; if compilation fails or runtime performance regresses, reduce stages to 2 or revert. Requires Triton/runtime support for the 'stages' parameter."
+  },
+  "workdir": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/variants/b5babbeb-7676-4e6e-accd-ad43a75bc9e2"
+}

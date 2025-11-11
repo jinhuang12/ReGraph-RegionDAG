@@ -1,0 +1,27 @@
+*** a/kernel.py
++++ b/kernel.py
+@@
+-@triton.jit
+-def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,
++@triton.jit(stages=3)
++def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,
+          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+          EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,
+          b_dtype: tl.constexpr):
+@@
+-@triton.jit
+-def do_expand_kernel(
++@triton.jit(stages=3)
++def do_expand_kernel(
+     pid_n,
+     lora_index,
+     slice_id,
+@@
+-@triton.jit
+-def _lora_expand_kernel(
++@triton.jit(stages=3)
++def _lora_expand_kernel(
+         input_ptr,
+         lora_ptr,
+         out_ptr,
+*** End Patch

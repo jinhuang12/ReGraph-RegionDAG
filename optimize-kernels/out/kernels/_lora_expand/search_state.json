@@ -1,0 +1,104 @@
+{
+  "baseline_ms": 0.46013749341169996,
+  "best_ms": 0.46013749341169996,
+  "best_state_hash": "0238cc3e157e74f96b446ee82f20d625cb9575b16f80b85652251386199b73f1",
+  "best_variant_dir": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/baseline",
+  "events_path": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/events.jsonl",
+  "graph_version": "2025-11-11.mcgsv1",
+  "nodes": {
+    "0238cc3e157e74f96b446ee82f20d625cb9575b16f80b85652251386199b73f1": {
+      "applied_actions": [],
+      "edges": {
+        "avoid_atomics_reduce": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.04,
+          "Q0": 0.02,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "cache_policy_cg": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.08,
+          "Q0": 0.04,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "change_block_sizes": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.08,
+          "Q0": 0.04,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "enable_async_pipeline": {
+          "N0": 2.0,
+          "Nsa": 8.0,
+          "P0": 0.36,
+          "Q0": 0.18,
+          "Qbar": 0.045,
+          "Qsum": 0.36,
+          "child": null
+        },
+        "grouped_gemm_colmajor": {
+          "N0": 2.0,
+          "Nsa": 3.0,
+          "P0": 0.12,
+          "Q0": 0.06,
+          "Qbar": 0.04,
+          "Qsum": 0.12,
+          "child": null
+        },
+        "pad_tail_and_mask": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.04,
+          "Q0": 0.02,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "softmax_math_fusion": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.04,
+          "Q0": 0.02,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "switch_to_mma_or_wgmma": {
+          "N0": 2.0,
+          "Nsa": 0.0,
+          "P0": 0.04,
+          "Q0": 0.02,
+          "Qbar": 0.0,
+          "Qsum": 0.0,
+          "child": null
+        },
+        "vectorize_global_loads": {
+          "N0": 2.0,
+          "Nsa": 5.0,
+          "P0": 0.2,
+          "Q0": 0.1,
+          "Qbar": 0.04,
+          "Qsum": 0.2,
+          "child": null
+        }
+      },
+      "ncu": {
+        "kernel_time_ms": 0.46013749341169996
+      },
+      "priors_built": true,
+      "source_code": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,\n         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n         EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,\n         b_dtype: tl.constexpr):\n    \"\"\"\n    Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of\n    B (k x n), iterate, through the K dimension to compute the partial/complete\n    matrix block product.\n    If SPLIT_K == 1, the output m x n product is complete.\n    If SPLIT_K > 1, the thread block computes partial outputs. The partial\n    outputs are then atomically summed in the caller code. \n    Args:\n        a_ptr: Array of pointers, identifying rows of A \n        b_ptr: Array of pointers, identifying columns of B\n        ak_stride: K dimension stride of the A matrix\n        bk_stride: K dimension stride of the B matrix\n        K: Length of the K dimension\n        BLOCK_M: M dimension of the output block m x n\n        BLOCK_N: N dimension of the output block m x n\n        BLOCK_K: K dimension atom\n        EVEN_K: True if the blocks of A and B can be loaded without any\n          masking.\n        SPLIT_K: Parameter signifying parallelism in the K dimension. \n        CAST_TYPE: if True, cast the values from the A matrix to the B\n          matrix dtype.\n        b_dtype: datatype of the B matrix\n    \"\"\"\n    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for k in range(tl.cdiv(K, BLOCK_K * SPLIT_K)):\n        if EVEN_K:\n            tiled_a = tl.load(a_ptr)\n            tiled_b = tl.load(b_ptr)\n        else:\n            tiled_a = tl.load(a_ptr,\n                              mask=offset_k[None, :]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n            tiled_b = tl.load(b_ptr,\n                              mask=offset_k[:, None]\n                              < K - k * (BLOCK_K * SPLIT_K),\n                              other=0)\n        if CAST_TYPE:\n            tiled_a = tiled_a.to(b_dtype)\n        accumulator += tl.dot(\n            tiled_a,\n            tiled_b,\n        )\n        a_ptr += BLOCK_K * SPLIT_K * ak_stride\n        b_ptr += BLOCK_K * SPLIT_K * bk_stride\n    return accumulator\n\n\n\n@triton.jit\ndef do_expand_kernel(\n    pid_n,\n    lora_index,\n    slice_id,\n    input_ptr,\n    lora_ptr,\n    out_ptr,\n    N,\n    K,\n    M_LEN,\n    ram,  # array identifying the rows of Input ptr to operate on\n    slice_start_loc,\n    # input ptr strides\n    input_d0_stride,\n    input_d1_stride,\n    input_d2_stride,\n    # lora ptr strides\n    ls_d0_ptr,\n    ls_d1_ptr,\n    ls_d2_ptr,\n    # out ptr strides\n    output_d0_stride,\n    output_d1_stride,\n    # constants\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n    BLOCK_K: tl.constexpr,\n    SAME_STRIDE: tl.constexpr,\n    SLICE_NUM: tl.constexpr,\n    EVEN_K: tl.constexpr,\n    CAST_TYPE: tl.constexpr,\n    ADD_INPUTS: tl.constexpr,\n):\n    \"\"\"\n    Given an array of integers that identifies the rows of A, ram,\n    a lora index that identifies which LoRA to use from lora_ptr, lora_index,\n    a slice_id that identifies the input/output slice,\n    compute the matrix product and store in the appropriate output location.\n    Given that this is an expand kernel, we don't perform any split-K reduction\n    as the K dimension is assumed to be small.\n    \"\"\"\n\n    # ls_d*_ptr can be either an integer or a pointer\n    if SAME_STRIDE:\n        # integer\n        cur_lora_d0_stride = ls_d0_ptr\n        cur_lora_d1_stride = ls_d1_ptr\n        cur_lora_d2_stride = ls_d2_ptr\n    else:\n        # pointer\n        cur_lora_d0_stride = tl.load(ls_d0_ptr + slice_id)\n        cur_lora_d1_stride = tl.load(ls_d1_ptr + slice_id)\n        cur_lora_d2_stride = tl.load(ls_d2_ptr + slice_id)\n\n    # Identify the input_ptr and lora_ptr from slice_id.\n    if SLICE_NUM == 1:\n        cur_input_ptr = input_ptr\n        cur_lora_ptr = lora_ptr\n    else:\n        cur_input_ptr = input_ptr + slice_id * input_d0_stride\n        cur_lora_ptr = tl.load(lora_ptr + slice_id).to(\n            tl.pointer_type(out_ptr.dtype.element_ty))\n\n    # Identify the column indices of B to process.\n    offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N\n    rbn = tl.max_contiguous(tl.multiple_of(offset_n % N, BLOCK_N), BLOCK_N)\n\n    # Identify A and B block pointers\n    offset_k = tl.arange(0, BLOCK_K)\n    a_ptr = (cur_input_ptr + ram[:, None] * input_d1_stride +\n             offset_k[None, :] * input_d2_stride)\n    b_ptr = (cur_lora_ptr + cur_lora_d0_stride * lora_index +\n             offset_k[:, None] * cur_lora_d2_stride +\n             rbn[None, :] * cur_lora_d1_stride)\n\n    # Compute the block matrix product.\n    SPLIT_K = 1\n    accumulator = mm_k(a_ptr, b_ptr, input_d2_stride, cur_lora_d2_stride,\n                       offset_k, K, BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, SPLIT_K,\n                       CAST_TYPE, cur_lora_ptr.dtype.element_ty)\n\n    tiled_c = accumulator.to(cur_lora_ptr.dtype.element_ty)\n    if SLICE_NUM == 1:\n        cur_slice_start = slice_start_loc\n    else:\n        cur_slice_start = tl.load(slice_start_loc + slice_id)\n\n    # Identify the C output pointers to store the results of the accumulator.\n    offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + cur_slice_start\n    offset_cm = tl.arange(0, BLOCK_M)\n    c_ptr = (out_ptr + ram[:, None] * output_d0_stride +\n             offset_cn[None, :] * output_d1_stride)\n    c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :]\n                                             < (cur_slice_start + N))\n\n    if ADD_INPUTS:\n        tiled_out = tl.load(c_ptr, mask=c_mask)\n        tiled_c += tiled_out\n    tl.store(c_ptr, tiled_c, mask=c_mask)\n\n@triton.jit\ndef _lora_expand_kernel(\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        M,\n        N,\n        K,\n        token_indices_sorted_by_lora_ids,\n        num_tokens_per_lora,\n        lora_token_start_loc,\n        lora_ids,\n        slice_start_loc,\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,  # 1\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,  # 1\n        output_d0_stride,\n        output_d1_stride,  # 1\n        output_hs_ptr,\n        BLOCK_M: tl.constexpr,\n        BLOCK_N: tl.constexpr,\n        BLOCK_K: tl.constexpr,\n        EVEN_K: tl.constexpr,\n        ADD_INPUTS: tl.constexpr,\n        CAST_TYPE: tl.constexpr,\n        SLICE_NUM: tl.constexpr,\n        SAME_STRIDE: tl.constexpr):\n\n    cta_n_num = tl.cdiv(N, BLOCK_N)\n    # M is the maximum token count owned by any LoRA; it bounds CTA rows.\n    cta_m_num = tl.cdiv(M, BLOCK_M)\n\n    pid_mn = tl.program_id(axis=0)\n    pid_m = pid_mn % cta_m_num\n    pid_n = (pid_mn // cta_m_num) % cta_n_num\n\n    slice_id = tl.program_id(axis=1)\n    lora_idx = tl.program_id(axis=2)\n\n    lora_id = tl.load(lora_ids + lora_idx)\n    if lora_id == -1:\n        # Early exit for the no-lora case.\n        return\n\n    lora_m_size = tl.load(num_tokens_per_lora + lora_idx)\n\n    cta_m_offset = pid_m * BLOCK_M\n    if cta_m_offset >= lora_m_size:\n        # Early exit CTA.\n        return\n\n    # When the output dimensions of each slice are the same,cur_n=N, otherwise\n    # cur_n=tl.load(output_hs_ptr + slice_id), this situation exists in GQA's\n    # qkv linear.\n    curr_N = N if SAME_STRIDE else tl.load(output_hs_ptr + slice_id)\n    if pid_n * BLOCK_N >= curr_N:\n        # Early exit CTA.\n        return\n\n    # num rows this CTA should process.\n    cta_m_len = min(BLOCK_M, lora_m_size - cta_m_offset)\n\n    # Identify all rows that this CTA should process.\n    lora_m_indices_start = tl.load(lora_token_start_loc + lora_idx)\n    cta_lora_seq_indices = (token_indices_sorted_by_lora_ids +\n                            lora_m_indices_start + cta_m_offset)\n\n    # Load all relevant row indices.\n    offset_m = tl.arange(0, BLOCK_M) % cta_m_len\n    ram = tl.load(cta_lora_seq_indices + offset_m)\n\n    do_expand_kernel(\n        pid_n,\n        lora_id,\n        slice_id,\n        input_ptr,\n        lora_ptr,\n        out_ptr,\n        curr_N,\n        K,\n        cta_m_len,\n        ram,  # array identifying the rows of Input ptr to operate on\n        slice_start_loc,\n        # input ptr strides\n        input_d0_stride,\n        input_d1_stride,\n        input_d2_stride,\n        # lora ptr strides\n        ls_d0_ptr,\n        ls_d1_ptr,\n        ls_d2_ptr,\n        # out ptr strides\n        output_d0_stride,\n        output_d1_stride,\n        # constants\n        BLOCK_M,\n        BLOCK_N,\n        BLOCK_K,\n        SAME_STRIDE,\n        SLICE_NUM,\n        EVEN_K,\n        CAST_TYPE,\n        ADD_INPUTS)",
+      "visits": 10
+    }
+  },
+  "root_state_hash": "0238cc3e157e74f96b446ee82f20d625cb9575b16f80b85652251386199b73f1",
+  "trace_path": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/trace.md"
+}

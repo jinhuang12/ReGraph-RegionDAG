@@ -1,0 +1,137 @@
+{
+  "canonical_moves": [
+    {
+      "brief": "Overlap gmem with compute via cp.async/TMA",
+      "name": "enable_async_pipeline",
+      "params": {
+        "stages": {
+          "enum": [
+            2,
+            3
+          ]
+        }
+      },
+      "touches": [
+        "gmem",
+        "overlap"
+      ]
+    },
+    {
+      "brief": "Use ld/st.v2/v4/v8 when aligned",
+      "name": "vectorize_global_loads",
+      "params": {
+        "targets": {
+          "enum": [
+            "LoadQ",
+            "LoadKV",
+            "LoadA",
+            "LoadB",
+            "X",
+            "Y",
+            "C"
+          ],
+          "list": true
+        },
+        "width": {
+          "enum": [
+            2,
+            4,
+            8
+          ]
+        }
+      },
+      "touches": [
+        "gmem"
+      ]
+    },
+    {
+      "brief": "Promote dot/FMA to MMA/WGMMA",
+      "name": "switch_to_mma_or_wgmma",
+      "params": {
+        "mma_kind": {
+          "enum": [
+            "mma.sync",
+            "wgmma"
+          ]
+        }
+      },
+      "touches": [
+        "compute"
+      ]
+    },
+    {
+      "brief": "Pad tails for contiguous vectorization",
+      "name": "pad_tail_and_mask",
+      "params": {
+        "dim": {
+          "enum": [
+            "K",
+            "N"
+          ]
+        },
+        "multiple_of": {
+          "enum": [
+            8,
+            16,
+            32
+          ]
+        }
+      },
+      "touches": [
+        "gmem",
+        "control"
+      ]
+    },
+    {
+      "brief": "Retune BLOCK sizes or launch to shift occupancy/overlap",
+      "name": "change_block_sizes",
+      "params": {
+        "BLOCK_K": "int",
+        "BLOCK_M": "int",
+        "BLOCK_N": "int",
+        "num_stages": "int",
+        "num_warps": "int"
+      },
+      "touches": [
+        "compute",
+        "gmem",
+        "overlap"
+      ]
+    },
+    {
+      "brief": "Use .cg to reduce L1 pollution for streaming",
+      "name": "cache_policy_cg",
+      "params": {},
+      "touches": [
+        "gmem"
+      ]
+    },
+    {
+      "brief": "Restructure to avoid atomics",
+      "name": "avoid_atomics_reduce",
+      "params": {},
+      "touches": [
+        "atomics",
+        "writeback"
+      ]
+    },
+    {
+      "brief": "Grouped scheduling/col-major to improve reuse",
+      "name": "grouped_gemm_colmajor",
+      "params": {},
+      "touches": [
+        "compute",
+        "gmem"
+      ]
+    },
+    {
+      "brief": "Fuse/approx math to reduce SFU",
+      "name": "softmax_math_fusion",
+      "params": {},
+      "touches": [
+        "sfu"
+      ]
+    }
+  ],
+  "graph_version": "2025-11-11.mcgsv1"
+}

@@ -1,0 +1,36 @@
+*** a/kernel.py
++++ b/kernel.py
+@@
+-@triton.jit
+-def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,
++@triton.jit
++def mm_k(a_ptr, b_ptr, ak_stride, bk_stride, offset_k, K: tl.constexpr,
+          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+          EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr, CAST_TYPE: tl.constexpr,
+          b_dtype: tl.constexpr):
+@@
+     """
+@@
+     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    # GROUPED_GEMM_COLMAJOR: treat B blocks for grouped GEMM as column-major
++    # Hint for downstream transform to schedule CTAs grouped by column and
++    # improve reuse for B across threads. No semantic change.
+     for k in range(tl.cdiv(K, BLOCK_K * SPLIT_K)):
+@@
+ @triton.jit
+ def do_expand_kernel(
+@@
+     # Identify A and B block pointers
+     offset_k = tl.arange(0, BLOCK_K)
+     a_ptr = (cur_input_ptr + ram[:, None] * input_d1_stride +
+              offset_k[None, :] * input_d2_stride)
+-    b_ptr = (cur_lora_ptr + cur_lora_d0_stride * lora_index +
+-             offset_k[:, None] * cur_lora_d2_stride +
+-             rbn[None, :] * cur_lora_d1_stride)
++    # GROUPED_GEMM_COLMAJOR: b_ptr arranged to favor column-major access for B
++    # This is an annotation for a downstream transform to reorganize scheduling
++    # so that B's columns are reused across grouped CTAs. No runtime change.
++    b_ptr = (cur_lora_ptr + cur_lora_d0_stride * lora_index +
++             offset_k[:, None] * cur_lora_d2_stride +
++             rbn[None, :] * cur_lora_d1_stride)
+*** End Patch

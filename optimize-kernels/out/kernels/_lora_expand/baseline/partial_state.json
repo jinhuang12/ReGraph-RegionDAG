@@ -1,0 +1,23 @@
+{
+  "last_phase": "timed",
+  "last_update": "2025-11-11T21:24:19",
+  "phases": {
+    "materialized": {
+      "data": {
+        "kernel_type": "triton",
+        "source_hash": "0238cc3e157e74f96b446ee82f20d625cb9575b16f80b85652251386199b73f1",
+        "source_path": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/baseline/kernel_module.py"
+      },
+      "timestamp": "2025-11-11T21:24:16"
+    },
+    "timed": {
+      "data": {
+        "launch_update_applied": true,
+        "mean_ms": 0.46013749341169996,
+        "ok": true,
+        "std_ms": 0.0005992980302326982
+      },
+      "timestamp": "2025-11-11T21:24:19"
+    }
+  }
+}

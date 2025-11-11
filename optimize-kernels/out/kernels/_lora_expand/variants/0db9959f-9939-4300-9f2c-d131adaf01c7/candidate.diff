@@ -1,0 +1,39 @@
+*** a/kernel.py
++++ b/kernel.py
+@@
+         if EVEN_K:
+-            tiled_a = tl.load(a_ptr)
+-            tiled_b = tl.load(b_ptr)
++            # VECT_LOAD: width=4 target=LoadA
++            tiled_a = tl.load(a_ptr)
++            # VECT_LOAD: width=4 target=LoadB
++            tiled_b = tl.load(b_ptr)
+         else:
+-            tiled_a = tl.load(a_ptr,
+-                              mask=offset_k[None, :]
+-                              < K - k * (BLOCK_K * SPLIT_K),
+-                              other=0)
+-            tiled_b = tl.load(b_ptr,
+-                              mask=offset_k[:, None]
+-                              < K - k * (BLOCK_K * SPLIT_K),
+-                              other=0)
++            # VECT_LOAD: width=4 target=LoadA
++            tiled_a = tl.load(a_ptr,
++                              mask=offset_k[None, :]
++                              < K - k * (BLOCK_K * SPLIT_K),
++                              other=0)
++            # VECT_LOAD: width=4 target=LoadB
++            tiled_b = tl.load(b_ptr,
++                              mask=offset_k[:, None]
++                              < K - k * (BLOCK_K * SPLIT_K),
++                              other=0)
+@@
+     if ADD_INPUTS:
+-        tiled_out = tl.load(c_ptr, mask=c_mask)
++        # VECT_LOAD: width=4 target=C
++        tiled_out = tl.load(c_ptr, mask=c_mask)
+         tiled_c += tiled_out
+-    tl.store(c_ptr, tiled_c, mask=c_mask)
++    # VECT_STORE: width=4 target=C
++    tl.store(c_ptr, tiled_c, mask=c_mask)
+*** End Patch

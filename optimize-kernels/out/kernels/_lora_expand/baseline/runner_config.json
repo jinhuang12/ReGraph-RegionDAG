@@ -1,0 +1,293 @@
+{
+  "invocation_example": "",
+  "io_contract": {
+    "args": [
+      {
+        "is_meta": false,
+        "name": "input_ptr",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "float32",
+          "init": {
+            "kind": "randn",
+            "seed": 42
+          },
+          "shape": [
+            1,
+            8192,
+            32
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "lora_ptr",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "float16",
+          "init": {
+            "kind": "randn",
+            "seed": 43
+          },
+          "shape": [
+            16,
+            5120,
+            32
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "out_ptr",
+        "role": "output",
+        "tensor_spec": {
+          "dtype": "float16",
+          "shape": [
+            8192,
+            5120
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "M",
+        "role": "input",
+        "type": "int",
+        "value": 8192
+      },
+      {
+        "is_meta": false,
+        "name": "N",
+        "role": "input",
+        "type": "int",
+        "value": 5120
+      },
+      {
+        "is_meta": false,
+        "name": "K",
+        "role": "input",
+        "type": "int",
+        "value": 32
+      },
+      {
+        "is_meta": false,
+        "name": "token_indices_sorted_by_lora_ids",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "int32",
+          "init": {
+            "kind": "arange",
+            "seed": 44,
+            "start": 0.0,
+            "step": 1.0
+          },
+          "shape": [
+            8192
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "num_tokens_per_lora",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "int32",
+          "init": {
+            "fill_value": 512.0,
+            "kind": "full",
+            "seed": 45
+          },
+          "shape": [
+            17
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "lora_token_start_loc",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "int32",
+          "init": {
+            "kind": "arange",
+            "seed": 46,
+            "start": 0.0,
+            "step": 512.0
+          },
+          "shape": [
+            18
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "lora_ids",
+        "role": "input",
+        "tensor_spec": {
+          "dtype": "int32",
+          "init": {
+            "kind": "arange",
+            "seed": 47,
+            "start": 0.0,
+            "step": 1.0
+          },
+          "shape": [
+            17
+          ]
+        },
+        "type": "tensor"
+      },
+      {
+        "is_meta": false,
+        "name": "slice_start_loc",
+        "role": "input",
+        "type": "int",
+        "value": 0
+      },
+      {
+        "is_meta": false,
+        "name": "input_d0_stride",
+        "role": "input",
+        "type": "int",
+        "value": 262144
+      },
+      {
+        "is_meta": false,
+        "name": "input_d1_stride",
+        "role": "input",
+        "type": "int",
+        "value": 32
+      },
+      {
+        "is_meta": false,
+        "name": "input_d2_stride",
+        "role": "input",
+        "type": "int",
+        "value": 1
+      },
+      {
+        "is_meta": false,
+        "name": "ls_d0_ptr",
+        "role": "input",
+        "type": "int",
+        "value": 163840
+      },
+      {
+        "is_meta": false,
+        "name": "ls_d1_ptr",
+        "role": "input",
+        "type": "int",
+        "value": 32
+      },
+      {
+        "is_meta": false,
+        "name": "ls_d2_ptr",
+        "role": "input",
+        "type": "int",
+        "value": 1
+      },
+      {
+        "is_meta": false,
+        "name": "output_d0_stride",
+        "role": "input",
+        "type": "int",
+        "value": 5120
+      },
+      {
+        "is_meta": false,
+        "name": "output_d1_stride",
+        "role": "input",
+        "type": "int",
+        "value": 1
+      },
+      {
+        "is_meta": false,
+        "name": "output_hs_ptr",
+        "role": "input",
+        "type": "int",
+        "value": 5120
+      },
+      {
+        "is_meta": true,
+        "name": "BLOCK_M",
+        "role": "input",
+        "type": "int",
+        "value": 16
+      },
+      {
+        "is_meta": true,
+        "name": "BLOCK_N",
+        "role": "input",
+        "type": "int",
+        "value": 64
+      },
+      {
+        "is_meta": true,
+        "name": "BLOCK_K",
+        "role": "input",
+        "type": "int",
+        "value": 32
+      },
+      {
+        "is_meta": true,
+        "name": "EVEN_K",
+        "role": "input",
+        "type": "bool",
+        "value": true
+      },
+      {
+        "is_meta": true,
+        "name": "ADD_INPUTS",
+        "role": "input",
+        "type": "bool",
+        "value": false
+      },
+      {
+        "is_meta": true,
+        "name": "CAST_TYPE",
+        "role": "input",
+        "type": "bool",
+        "value": true
+      },
+      {
+        "is_meta": true,
+        "name": "SLICE_NUM",
+        "role": "input",
+        "type": "int",
+        "value": 1
+      },
+      {
+        "is_meta": true,
+        "name": "SAME_STRIDE",
+        "role": "input",
+        "type": "bool",
+        "value": true
+      }
+    ],
+    "launch": {
+      "grid": {
+        "x": 40960,
+        "y": 1,
+        "z": 17
+      },
+      "num_stages": 2,
+      "num_warps": 4
+    }
+  },
+  "kernel_module_path": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/baseline/kernel_module.py",
+  "kernel_name": "_lora_expand_kernel",
+  "launch_update": {},
+  "result_path": "/home/ec2-user/optimize-kernels/out/kernels/_lora_expand/baseline/runner_result.json",
+  "root_path": "/home/ec2-user/optimize-kernels",
+  "timing": {
+    "iters": 100,
+    "repeat": 3,
+    "warmup": 10
+  }
+}
