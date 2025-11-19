@@ -3,25 +3,21 @@
 """
 optimize_kernels.py
 -------------------
-True Monte-Carlo Graph Search (MCGS) with a Region-DAG prior for optimizing Triton or CUDA kernels.
+True Monte-Carlo Graph Search (MCGS) for optimizing Triton or CUDA kernels,
+now with OFFLINE ReGraph collection and reuse.
 
-Key properties of this revision:
-- TRUE MCGS:
-  * Selection: multi-depth path from the root with PUCT at each visited node (progressive widening).
-  * Expansion: exactly one new child created at the leaf via LLM or rule-based proposal.
-  * Backpropagation: measured reward is propagated along the entire selected path (all edges).
-  * Transpositions: graph, not tree. States keyed by 'state_hash' are re-used, edges point to those nodes.
-  * NO greedy "promote child to root" behavior; the root stays the baseline. We maintain an 'incumbent best'.
-- Dirichlet noise: applied (once) to root priors to encourage root exploration.
-- Priors (Region-DAG): recomputed/merged for any node when fresh NCU metrics arrive, not only once.
-- Hashing: worker is the single source-of-truth for state hashes; orchestrator never precomputes them.
-- NCU cadence: '--ncu-every' triggers collection at selected nodes by visit cadence; results update priors.
-- Patch application: uses system 'patch' for robust diff application; failures abort the variant to avoid no-op builds.
-- CUDA compile cache: artifacts cached by (arch, sha256(source)) to skip recompiles.
-- Worker exits nonzero on hard failure; orchestrator always reads result.json.
-- Triton fixes:
-  * Runner records 'launch_update_applied' (True/False). Warns when non-empty LAUNCH_UPDATE is unused.
-  * If 'metadata.kernel_name' is present, runner invokes that function and passes LAUNCH_UPDATE explicitly.
+Additions in this revision:
+- Dataset logger (regraph_dataset.jsonl) capturing (from_method → to_method, reward, ok, etc.)
+- Offline ReGraph aggregator (regraph.json) with node/edge stats, CLI to build it
+- Online use of the offline ReGraph to constrain/guide expansion at unvisited nodes
+- Relabel step maps free-form LLM methods to canonical CUDA method set every step
+
+MCGS properties (aligned with the paper):
+- Selection: P-UCB at each visited node (graph-aware), progressive widening
+- Expansion: first visit -> expand *all* successors (LLM proposals), then pick one to evaluate
+- Rollout: ε-greedy argmax_a [ Q - λ N ] with step cap and early stop on failure
+- Reward: Eq.(3) piecewise; backprop the *maximum* reward observed in the rollout
+- Graph: transpositions enabled (child id keyed by worker-reported state hash if USE_HASH_FOR_NODE_ID)
 
 Author: (Your team)
 """
@@ -48,37 +44,31 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # Import workers modules
 from workers.state_manager import save_partial_state, load_partial_state, get_latest_phase_data
 from shared.model import DeviceProfile, KernelCode, _round_float_values, get_metadata_value
- 
+# --- Tools (LLM + Region-DAG + NCU) ---
+from kernel_opt_tooling import LLMCandidateGenerator, RegionDagContext, NcuMetricsContext, PtxSourceCorrelator
+
 # --------------------------- Constants & Config --------------------------
-GRAPH_VERSION = "2025-11-11.mcgsv1"
+# --- ReGraphT-style knobs ---
+ANTI_CYCLE_LAMBDA = 0.08    # discourage revisiting same (state,action) within THIS selection path
+EPSILON_SELECT    = 0.05    # tiny exploration in selection
+# --- Rollout policy (Eq.2) ---
+EPSILON_ROLLOUT   = 0.10    # ε for ε-greedy rollout
+LAMBDA_REG        = 0.50    # λ for Q(s,a) - λ N(s,a)
+ROLLOUT_MAX_STEPS = 4       # rollout horizon cap
+
+# Node identity: use worker's state_hash as node id (graph with transpositions)
+USE_HASH_FOR_NODE_ID = True
+
 MAX_DEPTH = 8
-DEFAULT_RULE_CANDIDATE_LIMIT = 6
-MIN_PRIOR_GAIN = 0.02
-PUCT_C = 1.0
-ROOT_NOISE_EPS = 0.25
-ROOT_NOISE_ALPHA = 0.30
 PW_K0, PW_K1, PW_ALPHA = 2, 3, 0.5
 DEFAULT_TIMING = {"warmup": 10, "iters": 100, "repeat": 3}
 COMPILE_CACHE_DIR = Path(os.environ.get("COMPILE_CACHE_DIR", "/tmp/kernel_compile_cache"))
 
-LLM_SYSTEM_PROMPT = """You are generating safe, minimal optimization patches for GPU kernels.
-You must output STRICT JSON with a single top-level object matching the provided schema.
-You may only propose moves from the allowed vocabulary. Do NOT change algorithmic semantics.
-If a unified diff cannot be produced reliably, include a 'full_source_code' override instead.
-"""
-
-# Canonical move vocabulary (extend over time and bump GRAPH_VERSION).
-CANONICAL_MOVES = [
-    {"name": "enable_async_pipeline", "brief": "Overlap gmem with compute via cp.async/TMA", "touches": ["gmem","overlap"], "params": {"stages":{"enum":[2,3]}}},
-    {"name": "vectorize_global_loads", "brief": "Use ld/st.v2/v4/v8 when aligned", "touches": ["gmem"], "params": {"width":{"enum":[2,4,8]},"targets":{"enum":["LoadQ","LoadKV","LoadA","LoadB","X","Y","C"],"list":True}}},
-    {"name": "switch_to_mma_or_wgmma", "brief": "Promote dot/FMA to MMA/WGMMA", "touches": ["compute"], "params": {"mma_kind":{"enum":["mma.sync","wgmma"]}}},
-    {"name": "pad_tail_and_mask", "brief": "Pad tails for contiguous vectorization", "touches": ["gmem","control"], "params": {"dim":{"enum":["K","N"]},"multiple_of":{"enum":[8,16,32]}}},
-    {"name": "change_block_sizes", "brief": "Retune BLOCK sizes or launch to shift occupancy/overlap", "touches": ["compute","gmem","overlap"], "params": {"BLOCK_M":"int","BLOCK_N":"int","BLOCK_K":"int","num_warps":"int","num_stages":"int"}},
-    {"name": "cache_policy_cg", "brief": "Use .cg to reduce L1 pollution for streaming", "touches": ["gmem"], "params": {}},
-    {"name": "avoid_atomics_reduce", "brief": "Restructure to avoid atomics", "touches": ["atomics","writeback"], "params": {}},
-    {"name": "grouped_gemm_colmajor", "brief": "Grouped scheduling/col-major to improve reuse", "touches": ["compute","gmem"], "params": {}},
-    {"name": "softmax_math_fusion", "brief": "Fuse/approx math to reduce SFU", "touches": ["sfu"], "params": {}},
-]
+# --- NEW: optional LLM relabeler (G.4-style) ---
+RELABLER_STRICT_JSON_INSTR = (
+    "Return STRICT JSON only as an array of objects. Each object must be:\n"
+    '{"index": <int>, "existed": "yes"|"no", "method": "<canonical_or_original>"}\n'
+)
 
 # ------------------------- Utility / Filesystem -------------------------
 def sha256_bytes(b: bytes) -> str:
@@ -116,180 +106,6 @@ def arch_sm_to_int(arch: str) -> int:
     m = re.search(r"sm_(\d+)", arch or "")
     return int(m.group(1)) if m else 0
 
-
-# ------------------------ Region-DAG (prior model) ----------------------
-@dataclass
-class RegionCaps:
-    compute_peak: float; bw_global: float; bw_shared: float; atomic_tp: float; sfu_tp: float
-
-@dataclass
-class RegionDagSummary:
-    total_time_pred_ms: float
-    stage_max: str
-    caps: RegionCaps
-
-def infer_region_caps_from_ncu(metrics: Dict[str, Any], profile: DeviceProfile) -> RegionCaps:
-    dram_util = float(metrics.get("dram_util", 0.6))
-    tensor_util = float(metrics.get("tensor_util", 0.4))
-    sfu_util = float(metrics.get("sfu_util", 0.2))
-    bw_global = (profile.hbm_bw_gbps * 1e9) / 8.0 * max(0.05, min(dram_util, 1.0))
-    base_tflops = 120e12 if arch_sm_to_int(profile.arch) >= 90 else 80e12
-    compute_peak = base_tflops * max(0.05, min(tensor_util, 1.0))
-    bw_shared = 3.0e12
-    atomic_tp = 1.0e12
-    sfu_tp = 200e9 * max(0.05, min(sfu_util, 1.0))
-    return RegionCaps(compute_peak, bw_global, bw_shared, atomic_tp, sfu_tp)
-
-def region_dag_prior_from_metrics(metrics: Dict[str, Any], profile: DeviceProfile) -> Tuple[RegionDagSummary, Dict[str, Dict[str, float]]]:
-    caps = infer_region_caps_from_ncu(metrics, profile)
-    util = {
-        "compute": float(metrics.get("tensor_util", 0.4)),
-        "gmem": float(metrics.get("dram_util", 0.6)),
-        "sfu": float(metrics.get("sfu_util", 0.2)),
-        "atomics": float(metrics.get("atom_util", 0.1)),
-        "smem": float(metrics.get("smem_util", 0.1)),
-    }
-    stage_max = max(util.items(), key=lambda kv: kv[1])[0]
-    total_ms = float(metrics.get("kernel_time_ms", 1.0))
-    summary = RegionDagSummary(total_ms, stage_max, caps)
-
-    move_effects: Dict[str, Dict[str, float]] = {}
-    def touches(name: str) -> List[str]:
-        for m in CANONICAL_MOVES:
-            if m["name"] == name: return m["touches"]
-        return []
-
-    for mv in CANONICAL_MOVES:
-        name = mv["name"]; t = set(touches(name))
-        affects_bottleneck = (stage_max in t) or ("overlap" in t and stage_max in ["gmem","compute"])
-        base_q0 = 0.02
-        if name == "enable_async_pipeline" and affects_bottleneck: base_q0 = 0.18
-        elif name == "switch_to_mma_or_wgmma" and stage_max == "compute": base_q0 = 0.12
-        elif name == "vectorize_global_loads" and stage_max == "gmem": base_q0 = 0.10
-        elif name == "softmax_math_fusion" and stage_max == "sfu": base_q0 = 0.08
-        elif name == "grouped_gemm_colmajor" and stage_max in ["compute","gmem"]: base_q0 = 0.06
-        elif name == "avoid_atomics_reduce" and stage_max == "atomics": base_q0 = 0.10
-        elif name == "cache_policy_cg" and stage_max == "gmem": base_q0 = 0.04
-        elif name == "change_block_sizes": base_q0 = 0.04
-        move_effects[name] = {"q0": base_q0, "p0": max(1e-4, base_q0)}
-
-    z = sum(e["p0"] for e in move_effects.values()) or 1.0
-    for e in move_effects.values(): e["p0"] /= z
-    return summary, move_effects
-
-# -------------------- OpenAI LLM-based candidate generation -------------
-class LLMCandidateGenerator:
-    def __init__(self, model: str, api_base: Optional[str] = None):
-        self.model = model; self.api_base = api_base; self.client = None
-        self.prev_id_by_kernel: Dict[str, str] = {}
-
-    def _lazy_client(self):
-        if self.client is None:
-            try:
-                from openai import OpenAI
-            except Exception as e:
-                raise RuntimeError("OpenAI SDK not installed. `pip install openai`") from e
-            self.client = OpenAI(base_url=self.api_base) if self.api_base else OpenAI()
-
-    def propose(self, kernel: KernelCode, region_summary: RegionDagSummary, allowed_moves: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        self._lazy_client()
-        km = {
-            "kernel_type": kernel.kernel_type,
-            "name": kernel.name,
-            "device_profile": _round_float_values(dataclasses.asdict(kernel.device_profile) if kernel.device_profile else {}),
-            "region_summary": _round_float_values(dataclasses.asdict(region_summary)),
-            "allowed_moves": allowed_moves,
-            "schema": {
-                "candidate_id": "uuid4 string",
-                "moves": [{"name": "enum", "params": "object with small integers/enums only"}],
-                "preconditions_asserted": ["string..."],
-                "predicted_effect": {"timelines_touched": ["gmem|compute|sfu|atomics|overlap|control"], "gmem_scale": "float?", "comp_scale": "float?", "overlap": "bool?"},
-                "patch": {"format":"unified-diff", "files":[{"path":"<file>", "diff":"<udiff>"}]},
-                "full_source_code": "optional string",
-                "launch_update": "optional Triton/CUDA launch knobs",
-                "risk_notes": "string",
-                "justification": "2-3 lines tying to bottleneck",
-            },
-        }
-        src_preview = kernel.source_code
-        inv_preview = (kernel.invocation_example or "")
-        km_json = json.dumps(km, indent=2)
-        user_content = [
-            {"type": "input_text", "text": "KERNEL SOURCE:\n" + src_preview},
-            {"type": "input_text", "text": "INVOCATION_EXAMPLE (may be empty):\n" + inv_preview},
-            {"type": "input_text", "text": "SCHEMA (JSON):\n" + km_json},
-            {"type": "input_text", "text": "Output STRICT JSON only. No prose. No markdown."},
-        ]
-        messages = [
-            {"role": "system", "content": [{"type": "input_text", "text": LLM_SYSTEM_PROMPT}]},
-            {"role": "user", "content": user_content},
-        ]
-        kwargs = dict(model=self.model, input=messages)
-        prev_id = self.prev_id_by_kernel.get(kernel.name)
-        if prev_id: kwargs["previous_response_id"] = prev_id
-        try:
-            resp = self.client.responses.create(**kwargs)
-            self.prev_id_by_kernel[kernel.name] = resp.id
-            raw_segments: List[str] = []
-            if getattr(resp, "output", None):
-                for output in resp.output:
-                    for content_item in getattr(output, "content", []) or []:
-                        text_val = getattr(content_item, "text", None)
-                        if isinstance(text_val, str):
-                            raw_segments.append(text_val)
-            raw = "\n".join(raw_segments)
-            raw_str = str(raw).strip()
-            raw_str = re.sub(r"^```(json)?", "", raw_str).strip()
-            raw_str = re.sub(r"```$", "", raw_str).strip()
-            return json.loads(raw_str)
-        except Exception as e:
-            print(f"[LLM] generation failed: {e}", file=sys.stderr)
-            return None
-
-# ------------------------ Rule-based fallback candidates -----------------
-def CANONICAL_MOVE_TOUCHES(name: str) -> List[str]:
-    for m in CANONICAL_MOVES:
-        if m["name"] == name:
-            return m["touches"]
-    return []
-
-def rule_based_candidates(kernel: KernelCode, region_summary: RegionDagSummary,
-                          allowed_names: Optional[List[str]]=None, limit: int = DEFAULT_RULE_CANDIDATE_LIMIT) -> List[Dict[str, Any]]:
-    """Basic safe candidates when LLM unavailable."""
-    allowed_names = set(allowed_names or [m["name"] for m in CANONICAL_MOVES])
-    out = []
-    if kernel.kernel_type == "cuda":
-        if "change_block_sizes" in allowed_names:
-            for bx in [64, 128, 256, 512]:
-                out.append({
-                    "candidate_id": str(uuid.uuid4()),
-                    "moves": [{"name":"change_block_sizes","params":{}}],
-                    "preconditions_asserted": [],
-                    "predicted_effect": {"timelines_touched": ["compute","gmem"]},
-                    "patch": {"format":"unified-diff","files":[]},
-                    "full_source_code": None,
-                    "launch_update": {"block": {"x": bx, "y": 1, "z": 1}},
-                    "risk_notes": "",
-                    "justification": f"Rule: block.x={bx} to shift occupancy",
-                })
-                if len(out) >= limit: break
-    else:
-        if "change_block_sizes" in allowed_names:
-            for nw in [2, 4, 8]:
-                out.append({
-                    "candidate_id": str(uuid.uuid4()),
-                    "moves": [{"name":"change_block_sizes","params":{}}],
-                    "preconditions_asserted": [],
-                    "predicted_effect": {"timelines_touched": ["compute","overlap"]},
-                    "patch": {"format":"unified-diff","files":[]},
-                    "full_source_code": None,
-                    "launch_update": {"num_warps": nw},
-                    "risk_notes": "",
-                    "justification": f"Rule: num_warps={nw} to trade occupancy/throughput",
-                })
-                if len(out) >= limit: break
-    return out
-
 # --------------------------- Subprocess Helper ---------------------------
 def run_subprocess(cmd: List[str], cwd: Optional[Path]=None, env: Optional[Dict[str,str]]=None, timeout: Optional[int]=None) -> Tuple[int, str, str]:
     proc = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -317,25 +133,204 @@ def apply_unified_diff(workdir: Path, files: List[Dict[str, str]]) -> bool:
     rc, out, err = run_subprocess([patch_bin, "-p0", "-r", "rejects.txt", "-i", str(diff_path)], cwd=workdir)
     return rc == 0
 
+# --------------------------- Dataset & ReGraph ---------------------------
+class ReGraphDataset:
+    """Append-only dataset for transitions; builds/loads aggregated ReGraph."""
+    def __init__(self, outdir: Path):
+        self.outdir = Path(outdir)
+        self.dataset_path = self.outdir / "regraph_dataset.jsonl"
+        self.regraph_path = self.outdir / "regraph.json"
+
+    def append_transition(self, rec: Dict[str, Any]) -> None:
+        """Append a single transition row."""
+        append_jsonl(self.dataset_path, rec)
+
+    def build_regraph(self) -> Dict[str, Any]:
+        """Aggregate dataset.jsonl into a compact ReGraph (nodes + edges)."""
+        nodes: Dict[str, Dict[str, Any]] = {}
+        edges: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if not self.dataset_path.exists():
+            rg = {"nodes": {}, "edges": {}, "built_at": now_iso()}
+            json_dump(rg, self.regraph_path)
+            return rg
+
+        def _inc_node(m: str, ok: bool, reward: float):
+            st = nodes.setdefault(m, {"count": 0, "success": 0, "sum_reward": 0.0})
+            st["count"] += 1
+            st["success"] += 1 if (reward or 0.0) > 0.0 and ok else 0
+            st["sum_reward"] += float(reward or 0.0)
+
+        def _inc_edge(u: str, v: str, ok: bool, reward: float):
+            bucket = edges.setdefault(u, {})
+            st = bucket.setdefault(v, {"count": 0, "success": 0, "sum_reward": 0.0})
+            st["count"] += 1
+            st["success"] += 1 if (reward or 0.0) > 0.0 and ok else 0
+            st["sum_reward"] += float(reward or 0.0)
+
+        with self.dataset_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                u = row.get("from_method") or "START"
+                v = row.get("to_method")
+                ok = bool(row.get("ok", False))
+                reward = float(row.get("reward", 0.0))
+                if not v:  # ignore malformed
+                    continue
+                _inc_node(u, ok, reward)
+                _inc_node(v, ok, reward)
+                _inc_edge(u, v, ok, reward)
+
+        # finalize means
+        for m, st in nodes.items():
+            cnt = max(1, st["count"])
+            st["mean_reward"] = st["sum_reward"] / float(cnt)
+        for u, adj in edges.items():
+            for v, st in adj.items():
+                cnt = max(1, st["count"])
+                st["mean_reward"] = st["sum_reward"] / float(cnt)
+
+        rg = {"nodes": nodes, "edges": edges, "built_at": now_iso()}
+        json_dump(rg, self.regraph_path)
+        return rg
+
+    def load_regraph(self) -> Dict[str, Any]:
+        if self.regraph_path.exists():
+            try:
+                return json_load(self.regraph_path)
+            except Exception:
+                pass
+        return {"nodes": {}, "edges": {}, "built_at": None}
+
 # --------------------------- Graph Structures ---------------------------
 @dataclass
 class EdgeStats:
     Qsum: float = 0.0
     Nsa:  float = 0.0
     Qbar: float = 0.0
-    P0:   float = 0.0
-    Q0:   float = 0.0
-    N0:   float = 2.0
-    child: Optional[str] = None      # child state hash if expanded
+    child: Optional[str] = None      # child state id if expanded
 
 @dataclass
 class NodeStats:
     visits: int = 0
-    priors_built: bool = False
     source_code: str = ""
     ncu: Dict[str, Any] = field(default_factory=dict)
-    edges: Dict[str, EdgeStats] = field(default_factory=dict)   # action -> EdgeStats
-    applied_actions: List[str] = field(default_factory=list)    # descriptive: sequence so far
+    edges: Dict[str, EdgeStats] = field(default_factory=dict)   # action_id -> EdgeStats
+    actions: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # action_id -> candidate payload
+    applied_actions: List[str] = field(default_factory=list)    # edge ids so far
+    applied_methods: List[str] = field(default_factory=list)    # canonical methods so far
+    last_method: Optional[str] = "START"
+    impl_hash: str = ""                                         # worker-reported state hash
+    ptx_path: Optional[str] = None
+    ncu_report_path: Optional[str] = None
+
+# --------------------------- Relabel (canonical methods) ------------------
+class LLMRelabeler:
+    def __init__(self, model: str):
+        self.model = model
+        self._client = None
+
+    def _lazy_client(self):
+        if self._client is None:
+            try:
+                from openai import OpenAI  # type: ignore
+            except Exception as e:
+                raise RuntimeError("OpenAI SDK not installed for relabel.") from e
+            self._client = OpenAI()
+
+    def relabel(self, existing_methods: list[str], steps: list[dict]) -> list[dict]:
+        """
+        steps: list of {'method': str, 'detail': str?, 'code': str?} (code optionally omitted)
+        returns: [{'index': i, 'existed': 'yes'|'no', 'method': '<canonical_or_original>'}, ...]
+        """
+        self._lazy_client()
+
+        compact_steps = [
+            {"index": i, "method": (s.get("method") or "").strip(), "detail": (s.get("detail") or "")[:512]}
+            for i, s in enumerate(steps)
+        ]
+
+        sys_msg = {
+            "role": "system",
+            "content": [{"type": "input_text", "text":
+                "You are normalizing CUDA optimization method names. "
+                "If a step's 'method' semantically matches one of the EXISTING METHODS, "
+                "output that exact canonical name. Otherwise, keep the original method name unchanged."
+            }]
+        }
+        user_msg = {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "EXISTING METHODS:\n" + json.dumps(existing_methods, ensure_ascii=False)},
+                {"type": "input_text", "text": "STEPS:\n" + json.dumps(compact_steps, ensure_ascii=False)},
+                {"type": "input_text", "text": RELABLER_STRICT_JSON_INSTR},
+            ]
+        }
+
+        resp = self._client.responses.create(
+            model=self.model,
+            input=[sys_msg, user_msg]
+        )
+
+        text_blobs = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                t = getattr(c, "text", None)
+                if isinstance(t, str):
+                    text_blobs.append(t)
+        raw = "\n".join(text_blobs).strip()
+
+        s = raw.strip()
+        if s.startswith("```"):
+            s = s.split("```", 2)[-1].strip()
+        relabeled = json.loads(s)
+        if not isinstance(relabeled, list):
+            raise ValueError("Relabeler did not return a JSON array.")
+        return relabeled
+
+# >>> CHANGED: add a simple fallback and a helper used by both expansion and rollout
+def relabel_fallback(existing_methods: list[str], steps: list[dict]) -> list[dict]:
+    out = []
+    existing_lower = [m.lower() for m in existing_methods]
+    for i, s in enumerate(steps):
+        method_raw = (s.get("method") or "").strip()
+        mlow = method_raw.lower()
+        match = None
+        for j, canon in enumerate(existing_lower):
+            if mlow == canon or canon in mlow or mlow in canon:
+                match = existing_methods[j]; break
+        if match:
+            out.append({"index": i, "existed": "yes", "method": match})
+        else:
+            out.append({"index": i, "existed": "no", "method": method_raw})
+    return out
+
+def relabel_methods(orch: "Orchestrator", search_state: Dict[str, Any], steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Canonicalize step['method'] -> step['method_canonical'] against evolving O in search_state['method_catalog'].
+    Grows O when relabel returns existed == 'no'.
+    """
+    O = list(search_state.get("method_catalog", []))
+    if not steps:
+        return steps
+    try:
+        relabeled = orch.relabeler.relabel(existing_methods=O, steps=steps)
+    except Exception:
+        relabeled = relabel_fallback(existing_methods=O, steps=steps)
+
+    for item in relabeled:
+        i = int(item["index"])
+        canon = (item.get("method") or "").strip()
+        steps[i]["method_canonical"] = canon
+        if item.get("existed") == "no":
+            if canon and canon not in O:
+                O.append(canon)
+    search_state["method_catalog"] = O
+    return steps
 
 # --------------------------- Orchestrator Core ---------------------------
 class Orchestrator:
@@ -346,12 +341,14 @@ class Orchestrator:
         self.gpus = [g.strip() for g in args.gpus.split(",") if g.strip()!=""]
         if not self.gpus:
             raise ValueError("--gpus must specify at least one device index")
-        self.ncu_every = int(args.ncu_every)
-        self.min_pred_gain = float(args.min_pred_gain)
-        self.llm = None
-        if not args.no_llm:
-            self.llm = LLMCandidateGenerator(model=args.llm_model, api_base=os.environ.get("OPENAI_BASE_URL"))
-        json_dump({"graph_version": GRAPH_VERSION, "canonical_moves": CANONICAL_MOVES}, self.outdir / "global_tactic_graph.json")
+        self.llm = LLMCandidateGenerator(model=args.llm_model)
+        self.relabeler = LLMRelabeler(model=args.llm_model)
+        # Offline ReGraph dataset & graph
+        self.rgds = ReGraphDataset(self.outdir)
+        if args.regraph_autobuild:
+            self.regraph = self.rgds.build_regraph()
+        else:
+            self.regraph = self.rgds.load_regraph()
 
     def load_kernel_specs(self) -> List[KernelCode]:
         p = Path(self.args.input)
@@ -371,35 +368,6 @@ class Orchestrator:
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", k.name)
         return self.outdir / "kernels" / safe
 
-    # ---------- Priors ----------
-    def _build_or_merge_priors(self, k: KernelCode, ns: NodeStats) -> RegionDagSummary:
-        metrics = ns.ncu or {"kernel_time_ms": 1.0}
-        profile = k.device_profile or DeviceProfile("unknown", "sm_90", 1, 65536, 228000, 1500.0)
-        summary, move_effects = region_dag_prior_from_metrics(metrics, profile)
-        for mv in CANONICAL_MOVES:
-            a = mv["name"]
-            eff = move_effects.get(a, {"p0": 0.0, "q0": 0.0})
-            es = ns.edges.get(a)
-            if es is None:
-                ns.edges[a] = EdgeStats(P0=eff["p0"], Q0=eff["q0"], N0=2.0, child=None)
-            else:
-                if es.Nsa < 3:
-                    es.P0 = eff["p0"]; es.Q0 = eff["q0"]
-                else:
-                    es.P0 = es.P0 or eff["p0"]; es.Q0 = es.Q0 or eff["q0"]
-        ns.priors_built = True
-        return summary
-
-    def _mix_root_dirichlet(self, ns: NodeStats):
-        # Apply once to root priors
-        names = [m["name"] for m in CANONICAL_MOVES]
-        noise = [random.gammavariate(ROOT_NOISE_ALPHA, 1.0) for _ in names]
-        z = sum(noise) or 1.0
-        noise = [x/z for x in noise]
-        for name, n in zip(names, noise):
-            if name not in ns.edges: continue
-            ns.edges[name].P0 = (1.0 - ROOT_NOISE_EPS) * ns.edges[name].P0 + ROOT_NOISE_EPS * n
-
     # ---------- Baseline ----------
     def baseline_or_resume(self, k: KernelCode) -> Tuple[Dict[str,Any], Dict[str,Any]]:
         kdir = self.kernel_dir(k)
@@ -415,14 +383,16 @@ class Orchestrator:
         bdir.mkdir(exist_ok=True)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.gpus[0]
+
         control = {
             "kernel": k.to_dict(),
             "variant": {"full_source_code": k.source_code, "patch": {"files": []}, "launch_update": {}},
             "workdir": str(bdir),
-            "ncu": {"enabled": self.ncu_every > 0, "collect": True},
+            "ncu": {"enabled": True, "collect": True},
             "timing": DEFAULT_TIMING,
         }
         json_dump(control, bdir / "control.json")
+
         rc, out, err = run_subprocess([sys.executable, __file__, "--worker", str(bdir / "control.json")], env=env)
         write_text(bdir / "stdout.log", out)
         write_text(bdir / "stderr.log", err)
@@ -434,37 +404,37 @@ class Orchestrator:
         # Materialized baseline
         source_path = bdir / ("kernel_module.py" if k.kernel_type == "triton" else "kernel.cu")
         baseline_source = source_path.read_text(encoding="utf-8") if source_path.exists() else k.source_code
-        root_hash = run["state_hash"]
+        worker_root_hash = run.get("state_hash", "")
+        root_hash = worker_root_hash if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
 
         # Graph init
         search_state = {
-            "graph_version": GRAPH_VERSION,
             "baseline_ms": run.get("mean_ms", 1e8),
             "best_ms": run.get("mean_ms", 1e8),
             "best_state_hash": root_hash,
             "best_variant_dir": str(bdir),
             "root_state_hash": root_hash,
+            "method_catalog": [],  # evolving canonical set O
             "nodes": { root_hash: dataclasses.asdict(NodeStats(
-                visits=0, priors_built=False,
+                visits=0,
                 source_code=baseline_source,
                 ncu=run.get("ncu_metrics", {"kernel_time_ms": run.get("mean_ms", 0.0)}),
-                edges={}, applied_actions=[]
+                edges={}, actions={}, applied_actions=[], applied_methods=[],
+                last_method="START",
+                impl_hash=worker_root_hash
             ))},
             "events_path": str(self.kernel_dir(k) / "events.jsonl"),
             "trace_path": str(self.kernel_dir(k) / "trace.md"),
         }
 
-        # Write trace header
+        # Trace header
         write_text(Path(search_state["trace_path"]),
-                   f"# Optimization trace for `{k.name}`\n\n- Baseline mean: **{run.get('mean_ms', 0.0):.3f} ms** (std {run.get('std_ms',0.0):.3f})\n- Device: {k.device_profile.gpu_name if k.device_profile else 'unknown'} / {k.device_profile.arch if k.device_profile else ''}\n- Graph version: `{GRAPH_VERSION}`\n\n")
+                   f"# Optimization trace for `{k.name}`\n\n- Baseline mean: **{run.get('mean_ms', 0.0):.3f} ms** (std {run.get('std_ms',0.0):.3f})\n- Device: {k.device_profile.gpu_name if k.device_profile else 'unknown'} / {k.device_profile.arch if k.device_profile else ''}\n\n")
 
-        # Build priors at root + apply Dirichlet noise once
+        # Persist state
         root_ns = NodeStats(**search_state["nodes"][root_hash])
         root_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in root_ns.edges.items()}
-        _ = self._build_or_merge_priors(k, root_ns)
-        self._mix_root_dirichlet(root_ns)
         search_state["nodes"][root_hash] = dataclasses.asdict(root_ns)
-
         json_dump(search_state, state_path)
         return search_state, run
 
@@ -477,7 +447,6 @@ class Orchestrator:
         best_ms = float(search_state["best_ms"])
         root_hash = search_state["root_state_hash"]
 
-        # Early failure detection: stop MCGS if baseline has inf (baseline execution failed)
         if math.isinf(baseline_ms):
             print(f"[MCGS] Skipping kernel '{k.name}': baseline execution failed (mean_ms = inf)")
             return
@@ -486,101 +455,146 @@ class Orchestrator:
         gpu_rr = 0
 
         while budget > 0:
-            path: List[Tuple[str, str]] = []  # (state_hash, action)
+            path: List[Tuple[str, str]] = []  # (state_hash, action_id)
             s = root_hash
             depth = 0
 
-            # ------ Selection: walk from root using PUCT ------
+            local_visits: Dict[Tuple[str, str], int] = {}
+            seen_states_in_path: set[str] = set([s])
+
+            # ------ Selection ------
             while depth < MAX_DEPTH:
                 ns = NodeStats(**search_state["nodes"][s])
                 ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in ns.edges.items()}
-                summary = self._build_or_merge_priors(k, ns) if not ns.priors_built else \
-                          self._build_or_merge_priors(k, ns)  # merge priors if ncu updated
+                search_state["nodes"][s] = dataclasses.asdict(ns)
+
                 # Progressive widening limit
                 limit = max(1, PW_K0 + int(PW_K1 * (ns.visits ** PW_ALPHA)))
 
-                # Candidate actions: exclude those that don't touch bottleneck
+                # If no actions yet -> expand here
+                if not ns.edges:
+                    break
+
+                # P-UCB(s): score = Qbar + sqrt(2 ln N / n)
                 cand: List[Tuple[float, str]] = []
                 for a, es in ns.edges.items():
-                    touches = set(CANONICAL_MOVE_TOUCHES(a))
-                    touches_bottleneck = summary.stage_max in touches or ("overlap" in touches and summary.stage_max in ["gmem","compute"])
-                    if not touches_bottleneck:
-                        continue
-                    # Proper pruning rules
-                    Qbar = es.Qbar if es.Nsa > 0 else es.Q0
-                    Nsa = es.Nsa if es.Nsa > 0 else es.N0
-                    if es.Nsa == 0 and es.Q0 < self.min_pred_gain:
-                        continue
-                    if es.Nsa > 5 and Qbar < self.min_pred_gain:
-                        continue
-                    U = Qbar + PUCT_C * es.P0 * (math.sqrt(max(1.0, float(ns.visits))) / (1.0 + Nsa))
+                    Qbar, Nsa = es.Qbar, es.Nsa
+                    U = Qbar + math.sqrt(max(0.0, 2.0 * math.log(max(1.0, float(ns.visits)) + 1.0)) / (Nsa + 1.0))
+                    U -= ANTI_CYCLE_LAMBDA * float(local_visits.get((s, a), 0))  # >>> CHANGED: single penalty
+                    if es.child and es.child in seen_states_in_path:
+                        U -= 1e9  # hard discourage cycles within path
                     cand.append((U, a))
 
                 if not cand:
-                    # Nothing promising; stop selection here
                     break
-
                 cand.sort(reverse=True)
                 cand_actions = [a for _, a in cand[:limit]]
 
-                # Choose best action
-                a_star = cand_actions[0]
+                # ε-greedy selection
+                a_star = random.choice(cand_actions) if random.random() < EPSILON_SELECT else cand_actions[0]
+                local_visits[(s, a_star)] = 1 + local_visits.get((s, a_star), 0)
                 path.append((s, a_star))
                 es = ns.edges[a_star]
 
-                # Descend if child exists; otherwise expand here
+                # Descend if child exists; else expand here
                 if es.child:
                     s = es.child
+                    seen_states_in_path.add(s)
                     depth += 1
                     continue
                 else:
-                    # Expand at this leaf
                     break
 
-            # If path ended with all expanded actions at deepest node, consume a visit and continue
             if not path:
-                # Root had nothing actionable (unlikely); stop
                 break
 
             leaf_state, leaf_action = path[-1]
             leaf_ns = NodeStats(**search_state["nodes"][leaf_state])
             leaf_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in leaf_ns.edges.items()}
 
-            # ------ Expansion: create child for (leaf_state, leaf_action) ------
-            # Prepare a proposal (LLM constrained to this action or rule-based)
-            summary_leaf = self._build_or_merge_priors(k, leaf_ns)
-            proposals: List[Dict[str,Any]] = []
-            if self.llm:
-                allowed = [m for m in CANONICAL_MOVES if m["name"] == leaf_action]
-                cand = self.llm.propose(k, summary_leaf, allowed)
-                if cand: proposals.append(cand)
-            if not proposals:
-                proposals.extend(rule_based_candidates(k, summary_leaf, allowed_names=[leaf_action], limit=1))
-            if not proposals:
-                # Mark a visit and continue
-                leaf_ns.visits += 1
+            # ------ Expansion on first visit ------
+            region_summary = {}
+            ncu_summary = {}
+            try:
+                if leaf_ns.ptx_path and Path(leaf_ns.ptx_path).exists():
+                    rctx = RegionDagContext(Path(leaf_ns.ptx_path).read_text(encoding="utf-8"), kernel_name="kernel")
+                    region_summary = rctx.overview()
+                if leaf_ns.ncu_report_path and Path(leaf_ns.ncu_report_path).exists():
+                    nctx = NcuMetricsContext(leaf_ns.ncu_report_path, range_idx=0, action_idx=0)
+                    ncu_summary = nctx.summary()
+            except Exception:
+                pass
+
+            if not leaf_ns.edges:
+                # Ask LLM for proposals (region/NCU summaries optional)
+                proposals_obj: Optional[Dict[str, Any]] = None
+                try:
+                    proposals_obj = self.llm.propose(k, region_summary=region_summary, ncu_summary=ncu_summary)  # if signature supports it
+                except TypeError:
+                    proposals_obj = self.llm.propose(k, region_summary=region_summary)  # backward-compat
+                if not proposals_obj or not proposals_obj.get("candidates"):
+                    # Count a visit and try another iteration
+                    leaf_ns.visits += 1
+                    search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
+                    json_dump(search_state, search_state_path)
+                    continue
+
+                # === ReGraphT-style relabel(LLM, τ, O) ===
+                steps = proposals_obj["candidates"]
+                steps = relabel_methods(self, search_state, steps)  # >>> CHANGED: unified relabel
+
+                # Offline ReGraph constraint at first expansion
+                last_m = leaf_ns.last_method or "START"
+                allowed = set(self.regraph.get("edges", {}).get(last_m, {}).keys())
+                if allowed:
+                    filtered = [c for c in steps if c.get("method_canonical") in allowed]
+                    if filtered:
+                        steps = filtered
+
+                # Register ALL proposals as actions with canonicalized methods
+                def _aid(c: Dict[str, Any]) -> str:
+                    key = (c.get("method_canonical","") + "\n" + (c.get("code","") or "")).encode("utf-8")
+                    return sha256_bytes(key)[:16]
+
+                for c in steps:
+                    aid = _aid(c)
+                    if aid not in leaf_ns.edges:
+                        leaf_ns.edges[aid] = EdgeStats()
+                    leaf_ns.actions[aid] = c
+
+                # Save node after registering actions
                 search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
                 json_dump(search_state, search_state_path)
-                continue
 
-            prop = proposals[0]
-            if not prop.get("moves") or prop["moves"][0]["name"] != leaf_action:
-                # Skip bad proposal; account visit
-                leaf_ns.visits += 1
-                search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
-                json_dump(search_state, search_state_path)
-                continue
+            # Choose one action to materialize now (greedy on Q; ties arbitrary)
+            leaf_ns = NodeStats(**search_state["nodes"][leaf_state])
+            if leaf_ns.edges:
+                scored = [((es.Qbar, a)) for a, es in leaf_ns.edges.items()]
+                scored.sort(key=lambda t: t[0], reverse=True)
+                leaf_action = scored[0][1]
+                path[-1] = (leaf_state, leaf_action)
 
-            # Launch worker
+            chosen = leaf_ns.actions.get(leaf_action, {})
+            def _candidate_to_variant(code_text: str, launch_update: Optional[Dict[str,Any]] = None) -> Dict[str, Any]:
+                code_text = code_text or ""
+                is_diff = code_text.startswith("--- ") or "+++" in code_text or code_text.startswith("diff --git")
+                if is_diff:
+                    return {"patch": {"files": [{"diff": code_text}]}, "launch_update": (launch_update or {})}
+                else:
+                    return {"full_source_code": code_text, "launch_update": (launch_update or {})}
+            prop = _candidate_to_variant(chosen.get("code",""), chosen.get("launch_update"))
+
+            # ------ Materialize chosen action ------
             gpu = self.gpus[gpu_rr % len(self.gpus)]; gpu_rr += 1
             job_id = str(uuid.uuid4())
             vdir = self.kernel_dir(k) / "variants" / job_id
             vdir.mkdir(parents=True, exist_ok=True)
+
             control = {
                 "kernel": k.to_dict(),
                 "variant": prop,
                 "workdir": str(vdir),
-                "ncu": {"enabled": self.ncu_every > 0, "collect": (leaf_ns.visits % self.ncu_every == 0) if self.ncu_every>0 else False},
+                "ncu": {"enabled": True, "collect": True},
                 "timing": DEFAULT_TIMING,
                 "base_source_code": leaf_ns.source_code,
             }
@@ -599,37 +613,42 @@ class Orchestrator:
                 ok = bool(result.get("ok", False))
 
             ms = float(result.get("mean_ms", 1e9))
-            child_hash = result.get("state_hash")
-            reward = max(0.0, baseline_ms / ms - 1.0) if ok else 0.0
+            worker_child_hash = result.get("state_hash")
+            child_id = worker_child_hash if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
 
-            # If success, add/merge child node and edge
-            if ok and child_hash:
+            # Reward (Eq.3)
+            if not ok:
+                reward = -1.0
+            else:
+                speedup = (baseline_ms / ms) if ms > 0 else 0.0
+                reward = speedup if speedup >= 1.0 else (speedup - 1.0)
+
+            # If success, add/merge child node and edge pointer
+            if ok and child_id:
                 materialized_source = result.get("materialized_source", "") or leaf_ns.source_code
-                child_entry = search_state["nodes"].get(child_hash)
-                if not child_entry:
-                    search_state["nodes"][child_hash] = dataclasses.asdict(NodeStats(
-                        visits=0, priors_built=False,
+                if child_id not in search_state["nodes"]:
+                    search_state["nodes"][child_id] = dataclasses.asdict(NodeStats(
+                        visits=0,
                         source_code=materialized_source,
                         ncu=result.get("ncu_metrics", {"kernel_time_ms": ms}),
-                        edges={}, applied_actions=(leaf_ns.applied_actions or []) + [leaf_action]
+                        edges={}, actions={}, applied_actions=(leaf_ns.applied_actions or []) + [leaf_action],
+                        applied_methods=(leaf_ns.applied_methods or []) + [chosen.get("method_canonical","")],
+                        last_method=chosen.get("method_canonical",""),
+                        impl_hash=worker_child_hash,
+                        ptx_path=result.get("ptx_path"),
+                        ncu_report_path=result.get("ncu_report_path")
                     ))
-                    # Build priors for the new child
-                    child_ns = NodeStats(**search_state["nodes"][child_hash])
-                    child_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in child_ns.edges.items()}
-                    _ = self._build_or_merge_priors(k, child_ns)
-                    search_state["nodes"][child_hash] = dataclasses.asdict(child_ns)
+                # attach child pointer
+                leaf_ns.edges[leaf_action].child = child_id
 
-                # Attach edge child pointer
-                leaf_ns.edges[leaf_action].child = child_hash
-
-                # Update incumbent best (for reporting) but DO NOT promote root
+                # Incumbent best
                 if ms < best_ms:
                     best_ms = ms
                     search_state["best_ms"] = ms
-                    search_state["best_state_hash"] = child_hash
+                    search_state["best_state_hash"] = child_id
                     search_state["best_variant_dir"] = str(vdir)
                     with open(search_state["trace_path"], "a", encoding="utf-8") as f:
-                        f.write(f"- {now_iso()}: **new best** {ms:.3f} ms via `{leaf_action}` (reward {reward:.3f}) → {vdir}\n")
+                        f.write(f"- {now_iso()}: **new best** {ms:.3f} ms via `{chosen.get('method_canonical','?')}` (reward {reward:.3f}) → {vdir}\n")
                     bdir = self.kernel_dir(k) / "best"
                     try:
                         if bdir.exists():
@@ -638,41 +657,147 @@ class Orchestrator:
                             else:
                                 shutil.rmtree(bdir)
                         os.symlink(vdir, bdir, target_is_directory=True)
-                    except OSError as e:
-                        print(f"[WARN] Symlink failed: {e}. Copying instead.", file=sys.stderr)
+                    except OSError:
                         if bdir.exists(): shutil.rmtree(bdir)
                         shutil.copytree(vdir, bdir)
                     json_dump({"best_ms": best_ms, "best_variant_dir": str(bdir), "action": leaf_action},
                               self.kernel_dir(k) / "best_summary.json")
 
-            # ------ Backpropagation: update all edges on path ------
-            # Materialize node objects (may have been updated)
-            search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
-            # Add leaf edge stats if missing
-            if leaf_action not in leaf_ns.edges:
-                leaf_ns.edges[leaf_action] = EdgeStats(P0=0.0, Q0=0.0, N0=1.0, child=child_hash)
+            # Dataset logging (expansion step)
+            self.rgds.append_transition({
+                "t": now_iso(), "kernel": k.name, "arch": (k.device_profile.arch if k.device_profile else None),
+                "from_method": leaf_ns.last_method or "START",
+                "to_method": chosen.get("method_canonical"),
+                "ok": ok, "mean_ms": ms, "baseline_ms": baseline_ms,
+                "speedup": (baseline_ms / ms) if (ok and ms>0) else 0.0,
+                "reward": reward, "candidate_id": leaf_action, "variant_dir": str(vdir)
+            })
 
-            # Iterate over the path edges and update values
+            # ------ Rollout (regularized) ------
+            rollout_best = reward
+            cur_state = leaf_ns.edges[leaf_action].child if ok and leaf_ns.edges.get(leaf_action) else None
+            steps_taken = 0
+            while ok and cur_state and steps_taken < ROLLOUT_MAX_STEPS:
+                cur_ns = NodeStats(**search_state["nodes"][cur_state])
+                cur_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in cur_ns.edges.items()}
+
+                # First visit? expand all successors
+                if not cur_ns.edges:
+                    # Ask LLM and relabel
+                    props_obj = None
+                    try:
+                        props_obj = self.llm.propose(k, region_summary={}, ncu_summary={})
+                    except TypeError:
+                        props_obj = self.llm.propose(k, region_summary={})
+                    candlist = relabel_methods(self, search_state, props_obj.get("candidates", []) if props_obj else [])
+
+                    # ReGraph constraint for rollout node
+                    last_m = cur_ns.last_method or "START"
+                    allowed = set(self.regraph.get("edges", {}).get(last_m, {}).keys())
+                    if allowed:
+                        filt = [c for c in candlist if c.get("method_canonical") in allowed]
+                        if filt: candlist = filt
+
+                    for c in candlist:
+                        aid = sha256_bytes((c.get("method_canonical","")+"\n"+(c.get("code","") or "")).encode("utf-8"))[:16]
+                        if aid not in cur_ns.edges:
+                            cur_ns.edges[aid] = EdgeStats()
+                        cur_ns.actions[aid] = c
+
+                    search_state["nodes"][cur_state] = dataclasses.asdict(cur_ns)
+                    json_dump(search_state, search_state_path)
+                    if not cur_ns.edges:
+                        break
+
+                # π(a|s): argmax_a [Q - λ N] w.p. 1-ε; else random
+                scored = [((es.Qbar - LAMBDA_REG * es.Nsa), a) for a, es in cur_ns.edges.items()]
+                a_roll = random.choice(list(cur_ns.edges.keys())) if random.random() < EPSILON_ROLLOUT else sorted(scored, reverse=True)[0][1]
+                cand = cur_ns.actions.get(a_roll, {})
+
+                # Materialize rollout step
+                vdir2 = self.kernel_dir(k) / "variants" / str(uuid.uuid4())
+                vdir2.mkdir(parents=True, exist_ok=True)
+                def _to_variant(c):
+                    code = c.get("code","") or ""
+                    is_diff = code.startswith("--- ") or "+++" in code or code.startswith("diff --git")
+                    return {"patch":{"files":[{"diff":code}]}} if is_diff else {"full_source_code":code}
+                control2 = {"kernel": k.to_dict(), "variant": _to_variant(cand), "workdir": str(vdir2),
+                            "ncu":{"enabled": True, "collect": True}, "timing": DEFAULT_TIMING,
+                            "base_source_code": cur_ns.source_code}
+                json_dump(control2, vdir2 / "control.json")
+                env2 = os.environ.copy(); env2["CUDA_VISIBLE_DEVICES"] = self.gpus[(steps_taken + gpu_rr) % len(self.gpus)]
+                p2 = subprocess.Popen([sys.executable, __file__, "--worker", str(vdir2 / "control.json")],
+                                      env=env2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                out2, err2 = p2.communicate()
+                write_text(vdir2 / "stdout.log", out2); write_text(vdir2 / "stderr.log", err2)
+
+                ok2 = False; res2 = {}
+                if (vdir2 / "result.json").exists():
+                    res2 = json_load(vdir2 / "result.json"); ok2 = bool(res2.get("ok", False))
+
+                parent_state = cur_state  # >>> CHANGED: remember parent before changing cur_state
+
+                if not ok2:
+                    r2 = -1.0
+                    ok = False
+                else:
+                    ms2 = float(res2.get("mean_ms", 1e9))
+                    sp2 = (baseline_ms / ms2) if ms2 > 0 else 0.0
+                    r2 = sp2 if sp2 >= 1.0 else (sp2 - 1.0)
+                    # attach next child
+                    child2 = res2.get("state_hash")
+                    child2 = child2 if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
+                    cur_ns.edges[a_roll].child = child2
+                    if child2 not in search_state["nodes"]:
+                        search_state["nodes"][child2] = dataclasses.asdict(NodeStats(
+                            visits=0, source_code=res2.get("materialized_source","") or cur_ns.source_code,
+                            ncu=res2.get("ncu_metrics",{}), edges={}, actions={}, applied_actions=(cur_ns.applied_actions or [])+[a_roll],
+                            applied_methods=(cur_ns.applied_methods or [])+[cand.get("method_canonical","")],
+                            last_method=cand.get("method_canonical",""),
+                            impl_hash=res2.get("state_hash"), ptx_path=res2.get("ptx_path"), ncu_report_path=res2.get("ncu_report_path")
+                        ))
+                    cur_state = child2
+
+                # update edge stats for rollout edge (persist to PARENT)  >>> CHANGED
+                cur_ns.visits += 1
+                esr = cur_ns.edges[a_roll]
+                esr.Nsa += 1.0; esr.Qsum += r2; esr.Qbar = esr.Qsum / max(1.0, esr.Nsa)
+                search_state["nodes"][parent_state] = dataclasses.asdict(cur_ns)  # write back to parent
+                json_dump(search_state, search_state_path)
+
+                rollout_best = max(rollout_best, r2)
+                steps_taken += 1
+
+                # dataset logging (rollout transitions)
+                self.rgds.append_transition({
+                    "t": now_iso(), "kernel": k.name, "arch": (k.device_profile.arch if k.device_profile else None),
+                    "from_method": cur_ns.last_method or "START",
+                    "to_method": cand.get("method_canonical"),
+                    "ok": ok2, "mean_ms": ms2 if ok2 else None, "baseline_ms": baseline_ms,
+                    "speedup": (baseline_ms / ms2) if (ok2 and ms2>0) else 0.0,
+                    "reward": r2, "candidate_id": a_roll, "variant_dir": str(vdir2)
+                })
+
+            # ------ Backpropagate max rollout reward ------
+            search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
             for (state_h, action_h) in path:
                 nsi = NodeStats(**search_state["nodes"][state_h])
                 nsi.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in nsi.edges.items()}
                 esi = nsi.edges[action_h]
                 nsi.visits += 1
-                if esi.Nsa == 0:
-                    # seed with prior virtual visits
-                    esi.Nsa = max(1.0, esi.N0)
-                    esi.Qsum = esi.Q0 * esi.N0
-                    esi.Qbar = esi.Q0
                 esi.Nsa += 1.0
-                esi.Qsum += reward
+                esi.Qsum += rollout_best
                 esi.Qbar = esi.Qsum / max(1.0, esi.Nsa)
                 search_state["nodes"][state_h] = dataclasses.asdict(nsi)
 
-            # Event log
+            # Event log (human trace)
             evt = {
                 "t": now_iso(), "kernel": k.name, "job_id": str(vdir.name), "gpu": self.gpus[(gpu_rr-1) % len(self.gpus)],
-                "leaf_state": leaf_state, "action": leaf_action, "candidate_id": prop.get("candidate_id"),
-                "mean_ms": ms, "reward": reward, "ok": ok, "child_state": child_hash, "variant_dir": str(vdir),
+                "leaf_state": leaf_state, "action": leaf_action, "candidate_id": leaf_action,
+                "mean_ms": ms, "reward": reward, "ok": ok,
+                "child_state": child_id if ok else None,
+                "variant_dir": str(vdir), "worker_child_hash": worker_child_hash,
+                "canonical_method": chosen.get("method_canonical")
             }
             append_jsonl(Path(search_state["events_path"]), evt)
 
@@ -689,11 +814,8 @@ def worker_main(control_path: str) -> int:
     """
     Worker:
       - Materializes source: full_source_code > base_source_code+patch > base_source_code.
-      - For Triton: either 'metadata.kernel_name' (preferred) or 'invocation_example'.
-        * Records 'launch_update_applied' (True/False) based on static check (LAUNCH_UPDATE token) and kernel_name path.
-      - For CUDA: uses compile cache; times with CUDA events; NaN/Inf check on outputs.
-      - Writes result.json with (ok, mean_ms, std_ms, state_hash, ncu_metrics, materialized_source).
-      - Returns 1 on hard failures.
+      - Triton: uses triton_runner; CUDA: nvcc -> cubin/ptx + cuda_runner.
+      - Writes result.json with (ok, mean_ms, std_ms, state_hash, ncu_metrics, materialized_source, ptx_path, ncu_report_path).
     """
     try:
         control = json_load(Path(control_path))
@@ -736,7 +858,6 @@ def worker_main(control_path: str) -> int:
         })
 
         if k.kernel_type == "triton":
-            # Create runner configuration
             runner_config = {
                 "root_path": str(Path(__file__).parent.resolve()),
                 "kernel_module_path": str(target_path.resolve()),
@@ -749,7 +870,6 @@ def worker_main(control_path: str) -> int:
             }
             json_dump(runner_config, workdir / "runner_config.json")
 
-            # Execute triton_runner module
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
             rc, out, err = run_subprocess(
@@ -765,7 +885,6 @@ def worker_main(control_path: str) -> int:
 
             r = json_load(workdir / "runner_result.json")
 
-            # Save state after timing
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
                 "std_ms": r.get("std_ms", 0.0),
@@ -773,7 +892,9 @@ def worker_main(control_path: str) -> int:
                 "launch_update_applied": r.get("launch_update_applied", False)
             })
 
-            write_text(workdir / "kernel.ptx", "// Triton PTX placeholder")
+            # Placeholders for PTX/SASS until you wire Triton → PTX extraction
+            ptx_path = workdir / "kernel.ptx"
+            write_text(ptx_path, "// Triton PTX placeholder")
             write_text(workdir / "kernel.sass", "// SASS placeholder")
             outj = {
                 "ok": bool(r.get("ok", False)),
@@ -783,6 +904,8 @@ def worker_main(control_path: str) -> int:
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
+                "ptx_path": str(ptx_path),
+                "ncu_report_path": None
             }
             json_dump(outj, workdir / "result.json")
             return 0
@@ -823,7 +946,6 @@ def worker_main(control_path: str) -> int:
                 except Exception:
                     pass
 
-            # Save state after compilation
             save_partial_state(workdir, "compiled", {
                 "ptx_path": str(workdir / "kernel.ptx"),
                 "cubin_path": str(workdir / "kernel.cubin"),
@@ -844,7 +966,6 @@ def worker_main(control_path: str) -> int:
                 if "block" in launch_update:
                     effective_io["launch"]["block"].update(launch_update["block"])
 
-            # Create runner configuration
             runner_config = {
                 "root_path": str(Path(__file__).parent.resolve()),
                 "kernel_cubin_path": str((workdir / "kernel.cubin").resolve()),
@@ -855,7 +976,6 @@ def worker_main(control_path: str) -> int:
             }
             json_dump(runner_config, workdir / "runner_config.json")
 
-            # Execute cuda_runner module
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
             rc, out, err = run_subprocess(
@@ -871,14 +991,12 @@ def worker_main(control_path: str) -> int:
 
             r = json_load(workdir / "runner_result.json")
 
-            # Save state after timing
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
                 "std_ms": r.get("std_ms", 0.0),
                 "ok": r.get("ok", False)
             })
 
-            # Compute final state hash (for consistency with Triton path)
             final_state_hash = sha256_str(materialized_source + json.dumps(effective_io or {}, sort_keys=True))
             outj = {
                 "ok": bool(r.get("ok", False)),
@@ -887,6 +1005,8 @@ def worker_main(control_path: str) -> int:
                 "state_hash": final_state_hash,
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
+                "ptx_path": str(workdir / "kernel.ptx"),
+                "ncu_report_path": None
             }
             json_dump(outj, workdir / "result.json")
             return 0
@@ -894,40 +1014,45 @@ def worker_main(control_path: str) -> int:
     except Exception as e:
         tb = traceback.format_exc()
         out = {"ok": False, "error": str(e), "traceback": tb}
-
-        # Try to include partial state for debugging
         try:
             workdir = Path(control["workdir"]) if "control" in locals() else Path(control_path).parent
             partial_state = get_latest_phase_data(workdir)
             if partial_state:
                 out["partial_state"] = partial_state
         except Exception:
-            pass  # Don't fail if we can't load partial state
-
+            pass
         json_dump(out, Path(control_path).parent / "result.json")
         return 1
 
 # ------------------------------- CLI -------------------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="MCGS + Region-DAG prior for GPU kernel optimization")
+    p = argparse.ArgumentParser(description="MCGS + Region-DAG prior + Offline ReGraph for GPU kernel optimization")
     p.add_argument("--input", default="kernels.json", help="JSON spec file or directory with .json specs")
     p.add_argument("--outdir", default="out", help="Output directory")
     p.add_argument("--gpus", default="0", help="Comma-separated GPU indices (e.g., 0,1,2)")
     p.add_argument("--budget-builds", type=int, default=20, help="Max rollout builds per kernel")
-    p.add_argument("--min-pred-gain", type=float, default=MIN_PRIOR_GAIN, help="Prune threshold for weak priors")
     p.add_argument("--llm-model", type=str, default="gpt-5-mini", help="OpenAI Responses model")
-    p.add_argument("--no-llm", action="store_true", help="Disable LLM; use rule-based moves only")
     p.add_argument("--resume", action="store_true", help="Resume from existing outdir state")
-    p.add_argument("--ncu-every", type=int, default=0, help="Collect metrics every N visits at the selected node (0=disable)")
     p.add_argument("--worker", nargs="?", help="(internal) Worker mode: path to control.json")
+    # Offline ReGraph controls
+    p.add_argument("--build-regraph", action="store_true", help="Scan dataset and rebuild offline ReGraph, then exit")
+    p.add_argument("--regraph-autobuild", action="store_true", help="Rebuild ReGraph before running search")
     return p.parse_args(argv)
 
 def main():
     args = parse_args()
+    # Worker mode
     if args.worker:
         sys.exit(worker_main(args.worker))
 
     orch = Orchestrator(args)
+
+    # Offline build-only mode
+    if args.build_regraph:
+        rg = orch.rgds.build_regraph()
+        print(f"ReGraph built with {len(rg.get('nodes',{}))} nodes.")
+        return
+
     kernels = orch.load_kernel_specs()
     for k in kernels:
         orch.baseline_or_resume(k)
