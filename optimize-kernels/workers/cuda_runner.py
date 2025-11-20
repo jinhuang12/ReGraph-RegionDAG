@@ -20,8 +20,12 @@ Config JSON format:
 Output JSON format (runner_result.json):
 {
     "ok": true,
-    "mean_ms": 1.234,
+    "mean_ms": 1.234,        # trimmed mean
+    "median_ms": 1.200,
+    "min_ms": 1.150,
     "std_ms": 0.056,
+    "trimmed_mean_ms": 1.234,
+    "error_type": "wrong_result",  // Only on validation failure
     "error": "...",  // Only on failure
     "traceback": "..."  // Only on failure
 }
@@ -43,8 +47,93 @@ if len(sys.argv) >= 2:
     except Exception:
         pass  # Fallback to PYTHONPATH
 
+import importlib.util
 import traceback
 from typing import Any, Dict, List, Tuple
+
+
+def _compute_stats(samples: List[float], trim_ratio: float = 0.2) -> Dict[str, float]:
+    """Compute trimmed-mean, median, std, and min for timing samples."""
+    import numpy as np
+
+    clean = [float(s) for s in samples if np.isfinite(s)]
+    if not clean:
+        return {"trimmed_mean_ms": float("inf"), "median_ms": float("inf"), "std_ms": 0.0, "min_ms": float("inf")}
+
+    clean.sort()
+    trim = int(len(clean) * trim_ratio)
+    trimmed = clean if trim * 2 >= len(clean) else clean[trim:-trim]
+
+    trimmed_arr = np.array(trimmed, dtype=float)
+    return {
+        "trimmed_mean_ms": float(np.mean(trimmed_arr)),
+        "median_ms": float(np.median(clean)),
+        "std_ms": float(np.std(trimmed_arr)),
+        "min_ms": float(np.min(clean)),
+    }
+
+
+def _load_reference_callable(reference_cfg: Dict[str, Any]):
+    """Load a Python callable for reference execution."""
+    module_path = reference_cfg.get("module_path")
+    fn_name = reference_cfg.get("fn_name", "reference")
+
+    if not module_path:
+        return None
+
+    spec = importlib.util.spec_from_file_location("cuda_reference_module", module_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, fn_name, None)
+
+
+def _validate_outputs(
+    outputs: List[Any],
+    args: List[Any],
+    cp: Any,
+    reference_cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Compare kernel outputs with reference callable when provided."""
+    import numpy as np
+
+    if not reference_cfg:
+        return True, ""
+
+    ref_callable = _load_reference_callable(reference_cfg)
+    if not callable(ref_callable):
+        return False, "reference_unavailable"
+
+    atol = float(reference_cfg.get("atol", 1e-3))
+    rtol = float(reference_cfg.get("rtol", 1e-3))
+
+    host_args = [cp.asnumpy(a) if hasattr(cp, "asnumpy") and isinstance(a, cp.ndarray) else a for a in args]
+    host_outputs = [cp.asnumpy(o) if hasattr(cp, "asnumpy") and isinstance(o, cp.ndarray) else o for o in outputs]
+
+    try:
+        ref_out = ref_callable(*host_args)
+    except Exception:
+        return False, "reference_execution_failed"
+
+    if ref_out is None:
+        return True, ""
+
+    if not isinstance(ref_out, (list, tuple)):
+        ref_out = [ref_out]
+
+    if len(ref_out) != len(host_outputs):
+        return False, "reference_output_mismatch"
+
+    for exp, act in zip(ref_out, host_outputs):
+        if not isinstance(exp, np.ndarray):
+            exp = np.array(exp)
+        if not isinstance(act, np.ndarray):
+            act = np.array(act)
+        if not np.allclose(exp, act, atol=atol, rtol=rtol):
+            return False, "wrong_result"
+
+    return True, ""
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -321,25 +410,38 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
             "traceback": traceback.format_exc()
         }
 
-    # Calculate statistics
-    mean_ms = float(np.mean(times))
-    std_ms = float(np.std(times))
+    stats = _compute_stats(times, trim_ratio=trim_ratio)
+    mean_ms = stats["trimmed_mean_ms"]
+    std_ms = stats["std_ms"]
+
+    # Reference validation
+    valid_outputs, error_type = _validate_outputs(outputs, args, cp, reference_cfg)
 
     # Validate outputs (check for NaN/Inf)
-    ok = True
+    ok = bool(valid_outputs)
     try:
         for out in outputs:
             if cp.any(cp.isnan(out)) or cp.any(cp.isinf(out)):
                 ok = False
+                if not error_type:
+                    error_type = "nan_or_inf"
                 break
     except Exception:
         pass  # Validation failure doesn't crash the runner
 
-    return {
+    result = {
         "ok": bool(ok),
         "mean_ms": mean_ms,
-        "std_ms": std_ms
+        "trimmed_mean_ms": mean_ms,
+        "median_ms": stats["median_ms"],
+        "min_ms": stats["min_ms"],
+        "std_ms": std_ms,
     }
+
+    if not ok and error_type:
+        result["error_type"] = error_type
+
+    return result
 
 
 def main() -> int:

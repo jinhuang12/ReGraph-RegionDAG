@@ -286,6 +286,7 @@ class KernelCode(BaseModel):
     source_code: str
     kernel_type: KernelType
     io: Optional[IOContract] = None
+    reference: Optional[Dict[str, Any]] = None
     # Metadata can be typed dataclass or dict for backward compatibility
     metadata: Optional[Union[BaseKernelMetadata, Dict[str, Any]]] = None
     device_profile: Optional[DeviceProfile] = None
@@ -313,6 +314,8 @@ class KernelCode(BaseModel):
                 result["metadata"] = self.metadata.model_dump()
             else:
                 result["metadata"] = self.metadata
+        if self.reference is not None:
+            result["reference"] = self.reference
         # Convert enum to string
         result["kernel_type"] = _enum_val(self.kernel_type)
         # Handle io specially if needed
@@ -357,5 +360,6 @@ class KernelCode(BaseModel):
             source_code=d["source_code"],
             kernel_type=kt,
             metadata=d.get("metadata"),
-            io=d.get("io")
+            io=d.get("io"),
+            reference=d.get("reference"),
         )

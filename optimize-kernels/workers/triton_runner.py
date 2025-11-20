@@ -26,8 +26,12 @@ Config JSON format:
 Output JSON format (runner_result.json):
 {
     "ok": true,
-    "mean_ms": 1.234,
+    "mean_ms": 1.234,        # trimmed mean
+    "median_ms": 1.210,
+    "min_ms": 1.180,
     "std_ms": 0.056,
+    "trimmed_mean_ms": 1.234,
+    "error_type": "wrong_result",  // Only on validation failure
     "launch_update_applied": true,
     "error": "...",  // Only on failure
     "traceback": "..."  // Only on failure
@@ -56,6 +60,8 @@ import time
 import traceback
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
+
 # Import from shared module for IOContract handling
 from shared.io_contract import IOContractManager
 from shared.model import IOContract
@@ -65,6 +71,41 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """Load runner configuration from JSON file."""
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _compute_stats(samples: List[float], trim_ratio: float = 0.2) -> Dict[str, float]:
+    """Compute trimmed-mean, median, std, and min for timing samples."""
+    clean = [float(s) for s in samples if np.isfinite(s)]
+    if not clean:
+        return {"trimmed_mean_ms": float("inf"), "median_ms": float("inf"), "std_ms": 0.0, "min_ms": float("inf")}
+
+    clean.sort()
+    trim = int(len(clean) * trim_ratio)
+    trimmed = clean if trim * 2 >= len(clean) else clean[trim:-trim]
+    trimmed_arr = np.array(trimmed, dtype=float)
+    return {
+        "trimmed_mean_ms": float(np.mean(trimmed_arr)),
+        "median_ms": float(np.median(clean)),
+        "std_ms": float(np.std(trimmed_arr)),
+        "min_ms": float(np.min(clean)),
+    }
+
+
+def _load_reference_callable(reference_cfg: Dict[str, Any], module: Any = None):
+    """Load a Python callable for reference execution."""
+    fn_name = reference_cfg.get("fn_name", "reference")
+    module_path = reference_cfg.get("module_path")
+
+    if module_path:
+        spec = importlib.util.spec_from_file_location("triton_reference_module", module_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+    if module is None:
+        return None
+
+    return getattr(module, fn_name, None)
 
 
 def load_kernel_module(kernel_path: Path) -> Tuple[Any, str]:
@@ -114,7 +155,7 @@ def find_triton_kernels(module: Any) -> List[Tuple[str, Any]]:
     return kernels
 
 
-def generate_inputs_from_io_contract(io_contract: Dict[str, Any], device) -> Tuple[List[Any], Any]:
+def generate_inputs_from_io_contract(io_contract: Dict[str, Any], device) -> Tuple[List[Any], Any, IOContract, IOContractManager]:
     """
     Generate tensor inputs from IOContract specification using IOContractManager.
 
@@ -146,7 +187,7 @@ def generate_inputs_from_io_contract(io_contract: Dict[str, Any], device) -> Tup
     else:
         grid = (1,)
 
-    return inputs, grid
+    return inputs, grid, io_contract_obj, manager
 
 
 def apply_launch_update(grid: Tuple, launch_update: Dict[str, Any]) -> Tuple:
@@ -163,6 +204,69 @@ def apply_launch_update(grid: Tuple, launch_update: Dict[str, Any]) -> Tuple:
         grid_list[2] = launch_update["grid_z"]
 
     return tuple(grid_list)
+
+
+def _validate_outputs(
+    outputs: Any,
+    reference_cfg: Dict[str, Any],
+    torch: Any,
+    ref_module: Any = None,
+    inputs: Any = None,
+):
+    """Compare outputs with a reference callable when provided."""
+    if not reference_cfg:
+        return True, ""
+
+    ref_callable = _load_reference_callable(reference_cfg, module=ref_module)
+    if not callable(ref_callable):
+        return False, "reference_unavailable"
+
+    atol = float(reference_cfg.get("atol", 1e-3))
+    rtol = float(reference_cfg.get("rtol", 1e-3))
+
+    host_outputs = outputs
+    if torch and host_outputs is not None:
+        if isinstance(host_outputs, (list, tuple)):
+            host_outputs = [o.detach().cpu() if torch.is_tensor(o) else o for o in host_outputs]
+        elif torch.is_tensor(host_outputs):
+            host_outputs = host_outputs.detach().cpu()
+
+    host_inputs = inputs
+    if torch and inputs is not None:
+        host_inputs = []
+        for inp in inputs:
+            if torch.is_tensor(inp):
+                host_inputs.append(inp.detach().cpu())
+            else:
+                host_inputs.append(inp)
+
+    try:
+        ref_out = ref_callable(*(host_inputs or [])) if host_inputs is not None else ref_callable()
+    except Exception:
+        return False, "reference_execution_failed"
+
+    if ref_out is None:
+        return True, ""
+
+    if not isinstance(ref_out, (list, tuple)):
+        ref_out = [ref_out]
+    if not isinstance(host_outputs, (list, tuple)):
+        host_outputs = [host_outputs]
+
+    if len(ref_out) != len(host_outputs):
+        return False, "reference_output_mismatch"
+
+    for exp, act in zip(ref_out, host_outputs):
+        if torch and torch.is_tensor(exp):
+            exp = exp.detach().cpu()
+        if torch and torch.is_tensor(act):
+            act = act.detach().cpu()
+        exp_np = exp.numpy() if hasattr(exp, "numpy") else np.array(exp)
+        act_np = act.numpy() if hasattr(act, "numpy") else np.array(act)
+        if not np.allclose(exp_np, act_np, atol=atol, rtol=rtol):
+            return False, "wrong_result"
+
+    return True, ""
 
 
 def run_kernel_io_contract_mode(
@@ -193,6 +297,8 @@ def run_kernel_io_contract_mode(
     kernel_path = Path(config["kernel_module_path"])
     kernel_name = config.get("kernel_name")
     timing = config["timing"]
+    trim_ratio = float(timing.get("trim_ratio", 0.2))
+    reference_cfg = config.get("reference", {}) or {}
     launch_update = config.get("launch_update", {})
     io_contract = config.get("io_contract", {})
 
@@ -244,7 +350,7 @@ def run_kernel_io_contract_mode(
     # Generate inputs from IOContract
     device = torch.device("cuda:0") if use_events else torch.device("cpu")
     try:
-        inputs, grid = generate_inputs_from_io_contract(io_contract, device)
+        inputs, grid, io_contract_obj, manager = generate_inputs_from_io_contract(io_contract, device)
     except Exception as e:
         return {
             "ok": False,
@@ -306,15 +412,43 @@ def run_kernel_io_contract_mode(
         print(f"Error during kernel execution: {error_msg}", file=sys.stderr)
         print(error_tb, file=sys.stderr)
 
-    mean_ms = float(sum(times) / len(times)) if times else float("inf")
-    std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5) if times else 0.0
+    stats = _compute_stats(times, trim_ratio=trim_ratio)
+    mean_ms = stats["trimmed_mean_ms"]
+    std_ms = stats["std_ms"]
+
+    outputs = None
+    error_type = None
+    if ok:
+        try:
+            outputs = manager.extract_outputs(inputs, io_contract_obj)
+            # Sanity NaN/Inf check
+            if torch and outputs is not None:
+                if isinstance(outputs, (list, tuple)):
+                    if any(torch.any(torch.isnan(o)) or torch.any(torch.isinf(o)) for o in outputs if torch.is_tensor(o)):
+                        ok = False
+                        error_type = "nan_or_inf"
+                elif torch.is_tensor(outputs) and (torch.any(torch.isnan(outputs)) or torch.any(torch.isinf(outputs))):
+                    ok = False
+                    error_type = "nan_or_inf"
+        except Exception:
+            pass
+
+    if ok:
+        valid_outputs, error_type = _validate_outputs(outputs, reference_cfg, torch, ref_module=module, inputs=inputs)
+        ok = ok and bool(valid_outputs)
 
     result = {
         "ok": bool(ok),
         "mean_ms": mean_ms,
+        "trimmed_mean_ms": mean_ms,
+        "median_ms": stats["median_ms"],
+        "min_ms": stats["min_ms"],
         "std_ms": std_ms,
         "launch_update_applied": True
     }
+
+    if not ok and error_type:
+        result["error_type"] = error_type
 
     if error_msg:
         result["error"] = error_msg
@@ -411,12 +545,16 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
         ok = False
         times = [float("inf")]
 
-    mean_ms = float(sum(times) / len(times))
-    std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5)
+    stats = _compute_stats(times, trim_ratio=trim_ratio)
+    mean_ms = stats["trimmed_mean_ms"]
+    std_ms = stats["std_ms"]
 
     return {
         "ok": bool(ok),
         "mean_ms": mean_ms,
+        "trimmed_mean_ms": mean_ms,
+        "median_ms": stats["median_ms"],
+        "min_ms": stats["min_ms"],
         "std_ms": std_ms,
         "launch_update_applied": bool(uses_update)
     }

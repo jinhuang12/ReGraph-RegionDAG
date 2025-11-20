@@ -65,6 +65,30 @@ PW_K0, PW_K1, PW_ALPHA = 2, 3, 0.5
 DEFAULT_TIMING = {"warmup": 10, "iters": 100, "repeat": 3}
 COMPILE_CACHE_DIR = Path(os.environ.get("COMPILE_CACHE_DIR", "/tmp/kernel_compile_cache"))
 
+
+def perf_ms(result: Dict[str, Any]) -> float:
+    """Prefer trimmed_mean/median when available for performance comparisons."""
+    for key in ("trimmed_mean_ms", "median_ms", "mean_ms", "min_ms"):
+        if key in result and result[key] is not None:
+            try:
+                return float(result[key])
+            except Exception:
+                continue
+    return float("inf")
+
+
+def is_outlier(result: Dict[str, Any]) -> bool:
+    """Identify noisy runs using variance and spread metrics."""
+    ms = perf_ms(result)
+    if not math.isfinite(ms) or ms <= 0:
+        return True
+    std_ms = float(result.get("std_ms", 0.0))
+    median_ms = float(result.get("median_ms", ms))
+    min_ms = float(result.get("min_ms", ms))
+    spread = std_ms / max(ms, 1e-9)
+    skew = abs(ms - median_ms) / max(median_ms, 1e-9)
+    return (spread > 0.5 and skew > 0.1) or (min_ms < 0.5 * ms and spread > 0.2)
+
 # --- NEW: optional LLM relabeler (G.4-style) ---
 RELABLER_STRICT_JSON_INSTR = (
     "Return STRICT JSON only as an array of objects. Each object must be:\n"
@@ -472,10 +496,14 @@ class Orchestrator:
         worker_root_hash = run.get("state_hash", "")
         root_hash = worker_root_hash if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
 
+        base_ms = perf_ms(run)
+        base_min = float(run.get("min_ms", base_ms))
+
         # Graph init
         search_state = {
-            "baseline_ms": run.get("mean_ms", 1e8),
-            "best_ms": run.get("mean_ms", 1e8),
+            "baseline_ms": base_ms,
+            "best_ms": base_ms,
+            "best_min_ms": base_min,
             "best_state_hash": root_hash,
             "best_variant_dir": str(bdir),
             "root_state_hash": root_hash,
@@ -496,7 +524,7 @@ class Orchestrator:
 
         # Trace header
         write_text(Path(search_state["trace_path"]),
-                   f"# Optimization trace for `{k.name}`\n\n- Baseline mean: **{run.get('mean_ms', 0.0):.3f} ms** (std {run.get('std_ms',0.0):.3f})\n- Device: {k.device_profile.gpu_name if k.device_profile else 'unknown'} / {k.device_profile.arch if k.device_profile else ''}\n\n")
+                   f"# Optimization trace for `{k.name}`\n\n- Baseline mean: **{base_ms:.3f} ms** (std {run.get('std_ms',0.0):.3f}, median {run.get('median_ms', base_ms):.3f})\n- Device: {k.device_profile.gpu_name if k.device_profile else 'unknown'} / {k.device_profile.arch if k.device_profile else ''}\n\n")
 
         # Persist state
         root_ns = NodeStats(**search_state["nodes"][root_hash])
@@ -511,8 +539,12 @@ class Orchestrator:
         search_state_path = kdir / "search_state.json"
         search_state = json_load(search_state_path)
         baseline_ms = float(search_state["baseline_ms"])
-        best_ms = float(search_state["best_ms"])
+        best_ms = float(search_state.get("best_ms", baseline_ms))
+        best_min_ms = float(search_state.get("best_min_ms", best_ms))
         root_hash = search_state["root_state_hash"]
+
+        if "best_min_ms" not in search_state:
+            search_state["best_min_ms"] = best_min_ms
 
         if math.isinf(baseline_ms):
             print(f"[MCGS] Skipping kernel '{k.name}': baseline execution failed (mean_ms = inf)")
@@ -699,7 +731,10 @@ class Orchestrator:
                 result = json_load(vdir / "result.json")
                 ok = bool(result.get("ok", False))
 
-            ms = float(result.get("mean_ms", 1e9))
+            ms = perf_ms(result)
+            result_outlier = is_outlier(result)
+            if result_outlier:
+                result["outlier"] = True
             worker_child_hash = result.get("state_hash")
             child_id = worker_child_hash if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
 
@@ -709,6 +744,8 @@ class Orchestrator:
             else:
                 speedup = (baseline_ms / ms) if ms > 0 else 0.0
                 reward = speedup if speedup >= 1.0 else (speedup - 1.0)
+                if result_outlier:
+                    reward *= 0.8
 
             # If success, add/merge child node and edge pointer
             if ok and child_id:
@@ -729,9 +766,12 @@ class Orchestrator:
                 leaf_ns.edges[leaf_action].child = child_id
 
                 # Incumbent best
-                if ms < best_ms:
+                better = ms < best_ms or (math.isclose(ms, best_ms, rel_tol=1e-3) and result.get("min_ms", ms) < best_min_ms)
+                if better:
                     best_ms = ms
+                    best_min_ms = min(best_min_ms, float(result.get("min_ms", ms)))
                     search_state["best_ms"] = ms
+                    search_state["best_min_ms"] = best_min_ms
                     search_state["best_state_hash"] = child_id
                     search_state["best_variant_dir"] = str(vdir)
                     with open(search_state["trace_path"], "a", encoding="utf-8") as f:
@@ -829,9 +869,14 @@ class Orchestrator:
                     r2 = -1.0
                     ok = False
                 else:
-                    ms2 = float(res2.get("mean_ms", 1e9))
+                    ms2 = perf_ms(res2)
+                    res2_outlier = is_outlier(res2)
+                    if res2_outlier:
+                        res2["outlier"] = True
                     sp2 = (baseline_ms / ms2) if ms2 > 0 else 0.0
                     r2 = sp2 if sp2 >= 1.0 else (sp2 - 1.0)
+                    if res2_outlier:
+                        r2 *= 0.8
                     # attach next child
                     child2 = res2.get("state_hash")
                     child2 = child2 if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
@@ -955,6 +1000,7 @@ def worker_main(control_path: str) -> int:
                 "launch_update": launch_update,
                 "io_contract": k.io.to_dict() if k.io else {},
                 "timing": timing,
+                "reference": k.reference,
                 "result_path": str((workdir / "runner_result.json").resolve())
             }
             json_dump(runner_config, workdir / "runner_config.json")
@@ -976,6 +1022,8 @@ def worker_main(control_path: str) -> int:
 
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
+                "median_ms": r.get("median_ms"),
+                "min_ms": r.get("min_ms"),
                 "std_ms": r.get("std_ms", 0.0),
                 "ok": r.get("ok", False),
                 "launch_update_applied": r.get("launch_update_applied", False)
@@ -988,11 +1036,16 @@ def worker_main(control_path: str) -> int:
             outj = {
                 "ok": bool(r.get("ok", False)),
                 "mean_ms": float(r.get("mean_ms", 1e9)),
+                "trimmed_mean_ms": float(r.get("trimmed_mean_ms", r.get("mean_ms", 1e9))),
+                "median_ms": float(r.get("median_ms", r.get("mean_ms", 1e9))),
+                "min_ms": float(r.get("min_ms", r.get("mean_ms", 1e9))),
                 "std_ms": float(r.get("std_ms", 0.0)),
                 "state_hash": state_hash,
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
+                "error_type": r.get("error_type"),
+                "outlier": r.get("outlier"),
                 "ptx_path": str(ptx_path),
                 "ncu_report_path": ncu_report_path
             }
@@ -1061,6 +1114,7 @@ def worker_main(control_path: str) -> int:
                 "kernel_name": get_metadata_value(k.metadata, "kernel_name", "kernel"),
                 "io_contract": effective_io or {},
                 "timing": timing,
+                "reference": k.reference,
                 "result_path": str((workdir / "runner_result.json").resolve())
             }
             json_dump(runner_config, workdir / "runner_config.json")
@@ -1082,6 +1136,8 @@ def worker_main(control_path: str) -> int:
 
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
+                "median_ms": r.get("median_ms"),
+                "min_ms": r.get("min_ms"),
                 "std_ms": r.get("std_ms", 0.0),
                 "ok": r.get("ok", False)
             })
@@ -1090,10 +1146,15 @@ def worker_main(control_path: str) -> int:
             outj = {
                 "ok": bool(r.get("ok", False)),
                 "mean_ms": float(r.get("mean_ms", 1e9)),
+                "trimmed_mean_ms": float(r.get("trimmed_mean_ms", r.get("mean_ms", 1e9))),
+                "median_ms": float(r.get("median_ms", r.get("mean_ms", 1e9))),
+                "min_ms": float(r.get("min_ms", r.get("mean_ms", 1e9))),
                 "std_ms": float(r.get("std_ms", 0.0)),
                 "state_hash": final_state_hash,
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
+                "error_type": r.get("error_type"),
+                "outlier": r.get("outlier"),
                 "ptx_path": str(workdir / "kernel.ptx"),
                 "ncu_report_path": ncu_report_path
             }
