@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # Import workers modules
 from workers.state_manager import save_partial_state, load_partial_state, get_latest_phase_data
 from shared.model import DeviceProfile, KernelCode, _round_float_values, get_metadata_value
+from shared.offline_predictor import OfflinePredictor, OfflineTrainer
 # --- Tools (LLM + Region-DAG + NCU) ---
 import kernel_opt_tooling
 from kernel_opt_tooling import LLMCandidateGenerator, RegionDagContext, NcuMetricsContext, PtxSourceCorrelator
@@ -56,6 +57,7 @@ EPSILON_SELECT    = 0.05    # tiny exploration in selection
 EPSILON_ROLLOUT   = 0.10    # ε for ε-greedy rollout
 LAMBDA_REG        = 0.50    # λ for Q(s,a) - λ N(s,a)
 ROLLOUT_MAX_STEPS = 4       # rollout horizon cap
+OFFLINE_PRIOR_WEIGHT = 0.15  # weight for offline prior + ReGraph bias
 
 # Node identity: use worker's state_hash as node id (graph with transpositions)
 USE_HASH_FOR_NODE_ID = True
@@ -399,6 +401,14 @@ class Orchestrator:
             self.regraph = self.rgds.build_regraph()
         else:
             self.regraph = self.rgds.load_regraph()
+        # Offline prior model
+        self.offline_model_path = Path(args.offline_model_path or (self.outdir / "offline_model.json"))
+        self.offline_predictor: Optional[OfflinePredictor] = None
+        if self.offline_model_path.exists():
+            try:
+                self.offline_predictor = OfflinePredictor.load(self.offline_model_path)
+            except Exception:
+                self.offline_predictor = None
 
     def load_kernel_specs(self) -> List[KernelCode]:
         p = Path(self.args.input)
@@ -417,6 +427,30 @@ class Orchestrator:
             raise ValueError(f"KernelCode object missing required 'name' field")
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", k.name)
         return self.outdir / "kernels" / safe
+
+    def train_offline_model(self) -> Optional[OfflinePredictor]:
+        trainer = OfflineTrainer(self.rgds.dataset_path, self.offline_model_path)
+        model = trainer.train_and_save(self.regraph)
+        if model:
+            self.offline_predictor = OfflinePredictor(model)
+            return self.offline_predictor
+        return None
+
+    def _edge_success_bias(self, prev_method: str, next_method: str) -> float:
+        edges = self.regraph.get("edges", {}) if isinstance(self.regraph.get("edges", {}), dict) else {}
+        stats = edges.get(prev_method, {}).get(next_method, {}) if isinstance(edges, dict) else {}
+        cnt = float(stats.get("count", 0.0) or 0.0)
+        succ = float(stats.get("success", 0.0) or 0.0)
+        reward_mean = float(stats.get("mean_reward", 0.0) or 0.0)
+        return (succ / max(1.0, cnt)) + reward_mean
+
+    def _offline_prior(self, node: NodeStats, candidate: Dict[str, Any], baseline_ms: float) -> float:
+        method = candidate.get("method_canonical") or candidate.get("method") or ""
+        prior = 0.0
+        if self.offline_predictor and method:
+            prior = self.offline_predictor.predict_for_node(dataclasses.asdict(node), method, baseline_ms, self.regraph)
+        prior += self._edge_success_bias(node.last_method or "START", method)
+        return prior
 
     # ---------- Baseline ----------
     def baseline_or_resume(self, k: KernelCode) -> Tuple[Dict[str,Any], Dict[str,Any]]:
@@ -580,6 +614,8 @@ class Orchestrator:
                     U -= ANTI_CYCLE_LAMBDA * float(local_visits.get((s, a), 0))  # >>> CHANGED: single penalty
                     if es.child and es.child in seen_states_in_path:
                         U -= 1e9  # hard discourage cycles within path
+                    cand_prior = self._offline_prior(ns, ns.actions.get(a, {}), baseline_ms)
+                    U += OFFLINE_PRIOR_WEIGHT * cand_prior
                     cand.append((U, a))
 
                 if not cand:
@@ -656,7 +692,10 @@ class Orchestrator:
             # Choose one action to materialize now (greedy on Q; ties arbitrary)
             leaf_ns = NodeStats(**search_state["nodes"][leaf_state])
             if leaf_ns.edges:
-                scored = [((es.Qbar, a)) for a, es in leaf_ns.edges.items()]
+                scored: List[Tuple[float, str]] = []
+                for a, es in leaf_ns.edges.items():
+                    prior = self._offline_prior(leaf_ns, leaf_ns.actions.get(a, {}), baseline_ms)
+                    scored.append(((es.Qbar + OFFLINE_PRIOR_WEIGHT * prior), a))
                 scored.sort(key=lambda t: t[0], reverse=True)
                 leaf_action = scored[0][1]
                 path[-1] = (leaf_state, leaf_action)
@@ -798,7 +837,10 @@ class Orchestrator:
                         break
 
                 # π(a|s): argmax_a [Q - λ N] w.p. 1-ε; else random
-                scored = [((es.Qbar - LAMBDA_REG * es.Nsa), a) for a, es in cur_ns.edges.items()]
+                scored = []
+                for a, es in cur_ns.edges.items():
+                    prior = self._offline_prior(cur_ns, cur_ns.actions.get(a, {}), baseline_ms)
+                    scored.append(((es.Qbar - LAMBDA_REG * es.Nsa + OFFLINE_PRIOR_WEIGHT * prior), a))
                 a_roll = random.choice(list(cur_ns.edges.keys())) if random.random() < EPSILON_ROLLOUT else sorted(scored, reverse=True)[0][1]
                 cand = cur_ns.actions.get(a_roll, {})
 
@@ -1126,6 +1168,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Offline ReGraph controls
     p.add_argument("--build-regraph", action="store_true", help="Scan dataset and rebuild offline ReGraph, then exit")
     p.add_argument("--regraph-autobuild", action="store_true", help="Rebuild ReGraph before running search")
+    # Offline model
+    p.add_argument("--train-offline-model", action="store_true", help="Train speedup predictor from trajectory logs and exit")
+    p.add_argument("--offline-model-path", default=None, help="Path to save/load offline model (default: <outdir>/offline_model.json)")
     return p.parse_args(argv)
 
 def main():
@@ -1140,6 +1185,14 @@ def main():
     if args.build_regraph:
         rg = orch.rgds.build_regraph()
         print(f"ReGraph built with {len(rg.get('nodes',{}))} nodes.")
+        return
+
+    if args.train_offline_model:
+        predictor = orch.train_offline_model()
+        if predictor:
+            print(f"Offline model trained with {len(predictor.model.feature_weights)} features → {orch.offline_model_path}")
+        else:
+            print("Offline model training skipped (no dataset rows).")
         return
 
     kernels = orch.load_kernel_specs()
