@@ -28,6 +28,8 @@ Output JSON format (runner_result.json):
 """
 
 # Path setup for imports from shared/ (must be before local imports)
+import copy
+import math
 import sys
 import json
 from pathlib import Path
@@ -209,6 +211,149 @@ def make_tensor(arg: Dict[str, Any], cp: Any) -> Any:
     return arr
 
 
+def apply_launch_update_to_io(io_contract: Dict[str, Any], launch_update: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of io_contract with launch updates merged in."""
+    updated = copy.deepcopy(io_contract) if io_contract else {"args": []}
+    if not launch_update:
+        return updated
+
+    launch_cfg = updated.setdefault("launch", {})
+    for key in ("grid", "block"):
+        if key in launch_update:
+            launch_cfg.setdefault(key, {})
+            launch_cfg[key].update(launch_update[key] or {})
+    return updated
+
+
+def merge_launch_updates(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    if override:
+        for k, v in override.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                nv = dict(merged[k])
+                nv.update(v)
+                merged[k] = nv
+            else:
+                merged[k] = v
+    return merged
+
+
+def aggregate_shape_results(shape_results: List[Dict[str, Any]], method: str) -> Dict[str, Any]:
+    method = (method or "weighted_mean").lower()
+    valid = [sr for sr in shape_results if math.isfinite(sr.get("mean_ms", float("inf")))]
+    ok_all = bool(shape_results) and all(sr.get("ok", False) for sr in shape_results)
+
+    if not valid:
+        return {"ok": False, "mean_ms": float("inf"), "std_ms": 0.0, "aggregation": {"method": method}}
+
+    weight_sum = sum(max(0.0, float(sr.get("weight", 1.0))) for sr in valid)
+    if weight_sum <= 0:
+        weight_sum = float(len(valid))
+
+    if method == "worst_case":
+        worst = max(valid, key=lambda sr: sr.get("mean_ms", float("inf")))
+        mean_ms = float(worst.get("mean_ms", float("inf")))
+        std_ms = float(worst.get("std_ms", 0.0))
+    else:
+        mean_ms = sum(float(sr.get("mean_ms", 0.0)) * max(0.0, float(sr.get("weight", 1.0))) for sr in valid) / weight_sum
+        std_ms = sum(float(sr.get("std_ms", 0.0)) * max(0.0, float(sr.get("weight", 1.0))) for sr in valid) / weight_sum
+
+    return {
+        "ok": ok_all,
+        "mean_ms": mean_ms,
+        "std_ms": std_ms,
+        "aggregation": {"method": method, "weights_sum": weight_sum},
+    }
+
+
+def execute_cuda_shape(cp: Any, np: Any, func: Any, io_contract: Dict[str, Any], timing: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a single IOContract configuration and measure timings."""
+    args = []
+    outputs = []
+
+    try:
+        for arg_spec in io_contract.get("args", []):
+            if arg_spec["type"] == "tensor":
+                arr = make_tensor(arg_spec, cp)
+                args.append(arr)
+                if arg_spec.get("role") in ("output", "inout"):
+                    outputs.append(arr)
+            else:
+                args.append(arg_spec["value"])
+
+        launch_config = io_contract.get("launch", {})
+        grid_spec = launch_config.get("grid", {"x": 1, "y": 1, "z": 1})
+        block_spec = launch_config.get("block", {"x": 1, "y": 1, "z": 1})
+
+        grid_t = (int(grid_spec.get("x", 1)), int(grid_spec.get("y", 1)), int(grid_spec.get("z", 1)))
+        block_t = (int(block_spec.get("x", 1)), int(block_spec.get("y", 1)), int(block_spec.get("z", 1)))
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": f"Failed to generate inputs: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+    try:
+        for _ in range(timing["warmup"]):
+            func(grid_t, block_t, tuple(args))
+        cp.cuda.Device().synchronize()
+    except Exception as e:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": f"Kernel execution failed during warmup: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+    times = []
+    try:
+        for _ in range(timing["repeat"]):
+            start = cp.cuda.Event()
+            end = cp.cuda.Event()
+            accum = 0.0
+
+            for _ in range(timing["iters"]):
+                start.record()
+                func(grid_t, block_t, tuple(args))
+                end.record()
+                end.synchronize()
+                accum += cp.cuda.get_elapsed_time(start, end)
+
+            times.append(accum / timing["iters"])
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": f"Kernel execution failed during timing: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+    mean_ms = float(np.mean(times))
+    std_ms = float(np.std(times))
+
+    ok = True
+    try:
+        for out in outputs:
+            if cp.any(cp.isnan(out)) or cp.any(cp.isinf(out)):
+                ok = False
+                break
+    except Exception:
+        pass
+
+    return {
+        "ok": bool(ok),
+        "mean_ms": mean_ms,
+        "std_ms": std_ms,
+    }
+
+
 def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute CUDA kernel using CuPy.
@@ -233,11 +378,12 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
 
     cubin_path = config["kernel_cubin_path"]
     kernel_name = config.get("kernel_name", "kernel")
-    io_contract = config["io_contract"]
+    base_io_contract = config.get("io_contract", {})
     timing = config["timing"]
+    shapes = config.get("representative_shapes") or []
+    base_launch_update = config.get("launch_update", {}) or {}
 
     try:
-        # Load CUDA module
         mod = cp.RawModule(path=cubin_path)
         func = mod.get_function(kernel_name)
     except Exception as e:
@@ -246,100 +392,34 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
             "mean_ms": float("inf"),
             "std_ms": 0.0,
             "error": f"Failed to load CUDA kernel: {e}",
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
         }
 
-    # Generate inputs from IOContract
-    args = []
-    outputs = []
+    def run_for_io(io_contract: Dict[str, Any], launch_update: Dict[str, Any]) -> Dict[str, Any]:
+        merged_update = merge_launch_updates(base_launch_update, launch_update or {})
+        merged_contract = apply_launch_update_to_io(io_contract, merged_update)
+        return execute_cuda_shape(cp, np, func, merged_contract, timing)
 
-    try:
-        for arg_spec in io_contract.get("args", []):
-            if arg_spec["type"] == "tensor":
-                arr = make_tensor(arg_spec, cp)
-                args.append(arr)
-                if arg_spec.get("role") in ("output", "inout"):
-                    outputs.append(arr)
-            else:
-                # Scalar argument
-                args.append(arg_spec["value"])
+    if shapes:
+        shape_results: List[Dict[str, Any]] = []
+        for idx, shape in enumerate(shapes):
+            io_override = shape.get("io") or shape.get("io_contract") or base_io_contract
+            shape_res = run_for_io(io_override, shape.get("launch_update"))
+            shape_res["shape_name"] = shape.get("name", f"shape_{idx}")
+            shape_res["weight"] = float(shape.get("weight", 1.0))
+            shape_results.append(shape_res)
 
-        # Get launch configuration
-        launch_config = io_contract.get("launch", {})
-        grid_spec = launch_config.get("grid", {"x": 1, "y": 1, "z": 1})
-        block_spec = launch_config.get("block", {"x": 1, "y": 1, "z": 1})
+        aggregated = aggregate_shape_results(shape_results, config.get("timing_aggregation", "weighted_mean"))
+        aggregated["shape_results"] = shape_results
+        aggregated["ok"] = aggregated.get("ok", False) and bool(shape_results)
+        aggregated["launch_update_applied"] = bool(base_launch_update) or any(
+            sr.get("launch_update_applied") for sr in shape_results
+        )
+        return aggregated
 
-        grid_t = (int(grid_spec.get("x", 1)), int(grid_spec.get("y", 1)), int(grid_spec.get("z", 1)))
-        block_t = (int(block_spec.get("x", 1)), int(block_spec.get("y", 1)), int(block_spec.get("z", 1)))
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "mean_ms": float("inf"),
-            "std_ms": 0.0,
-            "error": f"Failed to generate inputs: {e}",
-            "traceback": traceback.format_exc()
-        }
-
-    # Warmup
-    try:
-        for _ in range(timing["warmup"]):
-            func(grid_t, block_t, tuple(args))
-        cp.cuda.Device().synchronize()
-    except Exception as e:
-        return {
-            "ok": False,
-            "mean_ms": float("inf"),
-            "std_ms": 0.0,
-            "error": f"Kernel execution failed during warmup: {e}",
-            "traceback": traceback.format_exc()
-        }
-
-    # Timed runs
-    times = []
-    try:
-        for _ in range(timing["repeat"]):
-            start = cp.cuda.Event()
-            end = cp.cuda.Event()
-            accum = 0.0
-
-            for _ in range(timing["iters"]):
-                start.record()
-                func(grid_t, block_t, tuple(args))
-                end.record()
-                end.synchronize()
-                accum += cp.cuda.get_elapsed_time(start, end)
-
-            times.append(accum / timing["iters"])
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "mean_ms": float("inf"),
-            "std_ms": 0.0,
-            "error": f"Kernel execution failed during timing: {e}",
-            "traceback": traceback.format_exc()
-        }
-
-    # Calculate statistics
-    mean_ms = float(np.mean(times))
-    std_ms = float(np.std(times))
-
-    # Validate outputs (check for NaN/Inf)
-    ok = True
-    try:
-        for out in outputs:
-            if cp.any(cp.isnan(out)) or cp.any(cp.isinf(out)):
-                ok = False
-                break
-    except Exception:
-        pass  # Validation failure doesn't crash the runner
-
-    return {
-        "ok": bool(ok),
-        "mean_ms": mean_ms,
-        "std_ms": std_ms
-    }
+    single_result = run_for_io(base_io_contract, None)
+    single_result["launch_update_applied"] = bool(base_launch_update) or single_result.get("launch_update_applied", False)
+    return single_result
 
 
 def main() -> int:

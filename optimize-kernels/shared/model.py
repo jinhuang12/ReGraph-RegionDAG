@@ -280,12 +280,39 @@ class IOContract(BaseModel):
         return cls(**d)
 
 
+class RepresentativeShape(BaseModel):
+    """Representative input shape configuration for timing aggregation."""
+
+    name: str
+    io: Optional[IOContract] = None
+    weight: float = 1.0
+    launch_update: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra='ignore')
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to plain dict, preserving nested IOContract."""
+        out = self.model_dump(exclude_none=True)
+        if self.io:
+            out["io"] = self.io.to_dict()
+        return out
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "RepresentativeShape":
+        """Backward compatibility wrapper."""
+        if d.get("io") and isinstance(d["io"], dict):
+            d["io"] = IOContract.from_dict(d["io"])
+        return cls(**d)
+
+
 # Kernel Code Wrapper
 class KernelCode(BaseModel):
     """Wrapper for kernel source code with type information"""
     source_code: str
     kernel_type: KernelType
     io: Optional[IOContract] = None
+    representative_shapes: Optional[List[RepresentativeShape]] = None
+    timing_aggregation: str = "weighted_mean"
     # Metadata can be typed dataclass or dict for backward compatibility
     metadata: Optional[Union[BaseKernelMetadata, Dict[str, Any]]] = None
     device_profile: Optional[DeviceProfile] = None
@@ -304,6 +331,15 @@ class KernelCode(BaseModel):
         # Otherwise keep as dict for backward compatibility
         return v
 
+    @field_validator('representative_shapes', mode='before')
+    @classmethod
+    def parse_representative_shapes(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, list):
+            return [RepresentativeShape.from_dict(item) if isinstance(item, dict) else item for item in v]
+        return v
+
     def to_dict(self) -> Dict[str, Any]:
         """Backward compatibility wrapper"""
         result = self.model_dump(exclude_none=True)
@@ -318,6 +354,10 @@ class KernelCode(BaseModel):
         # Handle io specially if needed
         if self.io and hasattr(self.io, 'to_dict'):
             result["io"] = self.io.to_dict()
+        if self.representative_shapes:
+            result["representative_shapes"] = [
+                rs.to_dict() if hasattr(rs, "to_dict") else rs for rs in self.representative_shapes
+            ]
         return result
 
     def get_typed_metadata(self) -> Optional[BaseKernelMetadata]:
@@ -352,10 +392,12 @@ class KernelCode(BaseModel):
         kt = KernelType(kt) if not isinstance(kt, KernelType) else kt
         # Handle nested models that might be dicts
         if d.get("io") and isinstance(d["io"], dict):
-            d["io"] = IOContract(**d["io"])    
+            d["io"] = IOContract(**d["io"])
         return cls(
             source_code=d["source_code"],
             kernel_type=kt,
             metadata=d.get("metadata"),
-            io=d.get("io")
+            io=d.get("io"),
+            representative_shapes=d.get("representative_shapes"),
+            timing_aggregation=d.get("timing_aggregation", "weighted_mean")
         )

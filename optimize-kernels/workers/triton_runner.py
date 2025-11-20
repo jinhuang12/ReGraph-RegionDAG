@@ -52,9 +52,10 @@ if len(sys.argv) >= 2:
 
 import hashlib
 import importlib.util
+import math
 import time
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Import from shared module for IOContract handling
 from shared.io_contract import IOContractManager
@@ -165,8 +166,52 @@ def apply_launch_update(grid: Tuple, launch_update: Dict[str, Any]) -> Tuple:
     return tuple(grid_list)
 
 
+def merge_launch_updates(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Shallow merge for launch update dictionaries (override wins)."""
+    merged = dict(base or {})
+    if override:
+        merged.update(override)
+    return merged
+
+
+def aggregate_shape_results(shape_results: List[Dict[str, Any]], method: str) -> Dict[str, Any]:
+    """Aggregate per-shape timings into a single summary."""
+    method = (method or "weighted_mean").lower()
+    valid = [sr for sr in shape_results if math.isfinite(sr.get("mean_ms", float("inf")))]
+    ok_all = bool(shape_results) and all(sr.get("ok", False) for sr in shape_results)
+
+    if not valid:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "aggregation": {"method": method}
+        }
+
+    if method == "worst_case":
+        worst = max(valid, key=lambda sr: sr.get("mean_ms", float("inf")))
+        mean_ms = float(worst.get("mean_ms", float("inf")))
+        std_ms = float(worst.get("std_ms", 0.0))
+        weight_sum = sum(max(0.0, float(sr.get("weight", 1.0))) for sr in valid)
+    else:  # weighted_mean (default)
+        weight_sum = sum(max(0.0, float(sr.get("weight", 1.0))) for sr in valid)
+        if weight_sum <= 0:
+            weight_sum = float(len(valid))
+        mean_ms = sum(float(sr.get("mean_ms", 0.0)) * max(0.0, float(sr.get("weight", 1.0))) for sr in valid) / weight_sum
+        std_ms = sum(float(sr.get("std_ms", 0.0)) * max(0.0, float(sr.get("weight", 1.0))) for sr in valid) / weight_sum
+
+    return {
+        "ok": ok_all,
+        "mean_ms": mean_ms,
+        "std_ms": std_ms,
+        "aggregation": {"method": method, "weights_sum": weight_sum}
+    }
+
+
 def run_kernel_io_contract_mode(
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    io_contract_override: Dict[str, Any] = None,
+    launch_update_override: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
     Execute Triton kernel using IOContract-based approach.
@@ -193,8 +238,8 @@ def run_kernel_io_contract_mode(
     kernel_path = Path(config["kernel_module_path"])
     kernel_name = config.get("kernel_name")
     timing = config["timing"]
-    launch_update = config.get("launch_update", {})
-    io_contract = config.get("io_contract", {})
+    launch_update = launch_update_override if launch_update_override is not None else config.get("launch_update", {})
+    io_contract = io_contract_override if io_contract_override is not None else config.get("io_contract", {})
 
     try:
         module, _ = load_kernel_module(kernel_path)
@@ -422,6 +467,35 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def run_with_representative_shapes(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """If representative_shapes is provided, run each and aggregate results."""
+    shapes = config.get("representative_shapes") or []
+    if not shapes:
+        return None
+
+    shape_results: List[Dict[str, Any]] = []
+    base_launch_update = config.get("launch_update", {}) or {}
+
+    for idx, shape in enumerate(shapes):
+        io_override = shape.get("io") or shape.get("io_contract") or config.get("io_contract")
+        launch_override = merge_launch_updates(base_launch_update, shape.get("launch_update", {}))
+        shape_result = run_kernel_io_contract_mode(
+            config,
+            io_contract_override=io_override,
+            launch_update_override=launch_override,
+        )
+        shape_result["shape_name"] = shape.get("name", f"shape_{idx}")
+        shape_result["weight"] = float(shape.get("weight", 1.0))
+        shape_results.append(shape_result)
+
+    aggregated = aggregate_shape_results(shape_results, config.get("timing_aggregation", "weighted_mean"))
+    aggregated["shape_results"] = shape_results
+    aggregated["launch_update_applied"] = bool(config.get("launch_update")) or any(
+        sr.get("launch_update_applied") for sr in shape_results
+    )
+    return aggregated
+
+
 def main() -> int:
     """Main entry point for triton_runner."""
     if len(sys.argv) < 2:
@@ -440,12 +514,14 @@ def main() -> int:
     kernel_name = config.get("kernel_name")
     io_contract = config.get("io_contract")
 
-    if kernel_name and io_contract:
-        # Preferred: IOContract-based execution
-        result = run_kernel_io_contract_mode(config)
-    else:
-        # Fallback: Legacy invocation_example
-        result = run_kernel_legacy_mode(config)
+    result = run_with_representative_shapes(config)
+    if result is None:
+        if kernel_name and io_contract:
+            # Preferred: IOContract-based execution
+            result = run_kernel_io_contract_mode(config)
+        else:
+            # Fallback: Legacy invocation_example
+            result = run_kernel_legacy_mode(config)
 
     # Write result
     result_path = config.get("result_path", "runner_result.json")
