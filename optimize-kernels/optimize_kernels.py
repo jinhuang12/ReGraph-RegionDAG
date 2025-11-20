@@ -1065,6 +1065,61 @@ def worker_main(control_path: str) -> int:
             return 0
 
         else:  # CUDA
+            runner_mode = get_metadata_value(k.metadata, "runner_mode", None)
+            vllm_meta = get_metadata_value(k.metadata, "vllm", {}) or {}
+
+            if runner_mode == "vllm":
+                runner_config = {
+                    "root_path": str(Path(__file__).parent.resolve()),
+                    "mode": "vllm",
+                    "op_name": vllm_meta.get("op_name", get_metadata_value(k.metadata, "kernel_name", "")),
+                    "entry_path": vllm_meta.get("entry_path") or vllm_meta.get("entry"),
+                    "reference_path": vllm_meta.get("reference_path"),
+                    "cases": vllm_meta.get("shape_distribution", []),
+                    "dtype": vllm_meta.get("dtype", "float16"),
+                    "seed": vllm_meta.get("seed"),
+                    "timing": timing,
+                    "result_path": str((workdir / "runner_result.json").resolve())
+                }
+                json_dump(runner_config, workdir / "runner_config.json")
+
+                env = os.environ.copy()
+                env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
+                base_cmd = [sys.executable, "-m", "workers.cuda_runner", str((workdir / "runner_config.json").resolve())]
+                rc, out, err, ncu_report_path = run_runner_with_optional_ncu(
+                    base_cmd, workdir, env, None, ncu_control
+                )
+                write_text(workdir / "runner_stdout.log", out)
+                write_text(workdir / "runner_stderr.log", err)
+
+                if rc != 0 or not (workdir / "runner_result.json").exists():
+                    json_dump({"ok": False, "error": "runner failed", "rc": rc}, workdir / "result.json")
+                    return 1
+
+                r = json_load(workdir / "runner_result.json")
+
+                save_partial_state(workdir, "timed", {
+                    "mean_ms": r.get("mean_ms", 1e9),
+                    "std_ms": r.get("std_ms", 0.0),
+                    "ok": r.get("ok", False)
+                })
+
+                final_state_hash = sha256_str(materialized_source + json.dumps(runner_config, sort_keys=True))
+                outj = {
+                    "ok": bool(r.get("ok", False)),
+                    "mean_ms": float(r.get("mean_ms", 1e9)),
+                    "std_ms": float(r.get("std_ms", 0.0)),
+                    "state_hash": final_state_hash,
+                    "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
+                    "materialized_source": materialized_source,
+                    "ptx_path": "",
+                    "ncu_report_path": ncu_report_path
+                }
+                if "max_diff" in r:
+                    outj["max_diff"] = r["max_diff"]
+                json_dump(outj, workdir / "result.json")
+                return 0
+
             nvcc = shutil.which("nvcc")
             nvdisasm = shutil.which("nvdisasm") or shutil.which("cuobjdump")
             if not nvcc:
