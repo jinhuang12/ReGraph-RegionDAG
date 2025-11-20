@@ -422,7 +422,22 @@ class Orchestrator:
         kdir = self.kernel_dir(k)
         state_path = kdir / "search_state.json"
         if self.args.resume and state_path.exists():
-            return json_load(state_path), json_load(kdir / "baseline" / "run.json")
+            search_state = json_load(state_path)
+            run = json_load(kdir / "baseline" / "run.json")
+            root_hash = search_state.get("root_state_hash")
+            root_node = search_state.get("nodes", {}).get(root_hash, {}) if root_hash else {}
+            updated = False
+            if root_node is not None:
+                if not root_node.get("ptx_path") and run.get("ptx_path"):
+                    root_node["ptx_path"] = run.get("ptx_path")
+                    updated = True
+                if not root_node.get("ncu_report_path") and run.get("ncu_report_path"):
+                    root_node["ncu_report_path"] = run.get("ncu_report_path")
+                    updated = True
+                if updated and root_hash:
+                    search_state.setdefault("nodes", {})[root_hash] = root_node
+                    json_dump(search_state, state_path)
+            return search_state, run
 
         kdir.mkdir(parents=True, exist_ok=True)
         json_dump(k.to_dict(), kdir / "input_spec.json")
@@ -470,7 +485,9 @@ class Orchestrator:
                 ncu=run.get("ncu_metrics", {"kernel_time_ms": run.get("mean_ms", 0.0)}),
                 edges={}, actions={}, applied_actions=[], applied_methods=[],
                 last_method="START",
-                impl_hash=worker_root_hash
+                impl_hash=worker_root_hash,
+                ptx_path=run.get("ptx_path"),
+                ncu_report_path=run.get("ncu_report_path")
             ))},
             "events_path": str(self.kernel_dir(k) / "events.jsonl"),
             "trace_path": str(self.kernel_dir(k) / "trace.md"),
