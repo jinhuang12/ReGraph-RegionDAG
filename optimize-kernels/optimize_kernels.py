@@ -947,6 +947,8 @@ def worker_main(control_path: str) -> int:
         })
 
         if k.kernel_type == "triton":
+            ptx_path = workdir / "kernel.ptx"
+            sass_path = workdir / "kernel.sass"
             runner_config = {
                 "root_path": str(Path(__file__).parent.resolve()),
                 "kernel_module_path": str(target_path.resolve()),
@@ -955,7 +957,9 @@ def worker_main(control_path: str) -> int:
                 "launch_update": launch_update,
                 "io_contract": k.io.to_dict() if k.io else {},
                 "timing": timing,
-                "result_path": str((workdir / "runner_result.json").resolve())
+                "result_path": str((workdir / "runner_result.json").resolve()),
+                "ptx_path": str(ptx_path.resolve()),
+                "sass_path": str(sass_path.resolve())
             }
             json_dump(runner_config, workdir / "runner_config.json")
 
@@ -973,6 +977,7 @@ def worker_main(control_path: str) -> int:
                 return 1
 
             r = json_load(workdir / "runner_result.json")
+            ncu_report_path = ncu_report_path or r.get("ncu_report_path")
 
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
@@ -981,10 +986,6 @@ def worker_main(control_path: str) -> int:
                 "launch_update_applied": r.get("launch_update_applied", False)
             })
 
-            # Placeholders for PTX/SASS until you wire Triton → PTX extraction
-            ptx_path = workdir / "kernel.ptx"
-            write_text(ptx_path, "// Triton PTX placeholder")
-            write_text(workdir / "kernel.sass", "// SASS placeholder")
             outj = {
                 "ok": bool(r.get("ok", False)),
                 "mean_ms": float(r.get("mean_ms", 1e9)),
@@ -993,7 +994,8 @@ def worker_main(control_path: str) -> int:
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
-                "ptx_path": str(ptx_path),
+                "ptx_path": str(r.get("ptx_path", ptx_path)),
+                "sass_path": str(r.get("sass_path", sass_path)),
                 "ncu_report_path": ncu_report_path
             }
             json_dump(outj, workdir / "result.json")
@@ -1079,6 +1081,7 @@ def worker_main(control_path: str) -> int:
                 return 1
 
             r = json_load(workdir / "runner_result.json")
+            ncu_report_path = ncu_report_path or r.get("ncu_report_path")
 
             save_partial_state(workdir, "timed", {
                 "mean_ms": r.get("mean_ms", 1e9),
