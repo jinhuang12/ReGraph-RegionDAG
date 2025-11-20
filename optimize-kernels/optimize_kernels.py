@@ -117,6 +117,55 @@ def run_subprocess(cmd: List[str], cwd: Optional[Path]=None, env: Optional[Dict[
         out, err = proc.communicate()
         return 124, out, err
 
+
+def find_ncu_cli() -> Optional[str]:
+    """Return the first available Nsight Compute CLI binary."""
+    for cand in ("ncu", "nv-nsight-cu-cli"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    return None
+
+
+def find_latest_ncu_report(workdir: Path) -> Optional[Path]:
+    """Find the most recent Nsight Compute report generated in workdir."""
+    candidates: List[Path] = []
+    for ext in (".ncu-rep", ".nsight-cuprof-report"):
+        candidates.extend(workdir.glob(f"*{ext}"))
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def run_runner_with_optional_ncu(
+    base_cmd: List[str],
+    workdir: Path,
+    env: Dict[str, str],
+    kernel_name: Optional[str],
+    ncu_control: Dict[str, Any],
+    timeout: int = 900,
+) -> Tuple[int, str, str, Optional[str]]:
+    """Run the runner command, optionally wrapped in Nsight Compute."""
+    ncu_report_path: Optional[str] = None
+    if ncu_control.get("enabled"):
+        ncu_bin = find_ncu_cli()
+        if ncu_bin:
+            ncu_cmd = [ncu_bin, "-f", "-o", "ncu_report"]
+            if kernel_name:
+                ncu_cmd.extend(["-k", kernel_name])
+            ncu_cmd.extend(base_cmd)
+            rc, out, err = run_subprocess(ncu_cmd, cwd=workdir, env=env, timeout=timeout)
+            report = find_latest_ncu_report(workdir)
+            if report:
+                ncu_report_path = str(report)
+            return rc, out, err, ncu_report_path
+
+    rc, out, err = run_subprocess(base_cmd, cwd=workdir, env=env, timeout=timeout)
+    return rc, out, err, ncu_report_path
+
 # --------------------------- Patch Application ---------------------------
 def apply_unified_diff(workdir: Path, files: List[Dict[str, str]]) -> bool:
     """Apply a list of unified diffs. Requires `patch` on PATH; returns True on success."""
@@ -823,6 +872,7 @@ def worker_main(control_path: str) -> int:
         variant = control.get("variant", {}) or {}
         workdir = Path(control["workdir"])
         timing = control.get("timing", DEFAULT_TIMING)
+        ncu_control = control.get("ncu", {}) or {}
         base_source_code = control.get("base_source_code", k.source_code)
         launch_update = variant.get("launch_update", {}) or {}
 
@@ -872,9 +922,9 @@ def worker_main(control_path: str) -> int:
 
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
-            rc, out, err = run_subprocess(
-                [sys.executable, "-m", "workers.triton_runner", str((workdir / "runner_config.json").resolve())],
-                cwd=workdir, env=env, timeout=900
+            base_cmd = [sys.executable, "-m", "workers.triton_runner", str((workdir / "runner_config.json").resolve())]
+            rc, out, err, ncu_report_path = run_runner_with_optional_ncu(
+                base_cmd, workdir, env, runner_config.get("kernel_name"), ncu_control
             )
             write_text(workdir / "runner_stdout.log", out)
             write_text(workdir / "runner_stderr.log", err)
@@ -905,7 +955,7 @@ def worker_main(control_path: str) -> int:
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
                 "ptx_path": str(ptx_path),
-                "ncu_report_path": None
+                "ncu_report_path": ncu_report_path
             }
             json_dump(outj, workdir / "result.json")
             return 0
@@ -978,9 +1028,9 @@ def worker_main(control_path: str) -> int:
 
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
-            rc, out, err = run_subprocess(
-                [sys.executable, "-m", "workers.cuda_runner", str((workdir / "runner_config.json").resolve())],
-                cwd=workdir, env=env, timeout=900
+            base_cmd = [sys.executable, "-m", "workers.cuda_runner", str((workdir / "runner_config.json").resolve())]
+            rc, out, err, ncu_report_path = run_runner_with_optional_ncu(
+                base_cmd, workdir, env, runner_config.get("kernel_name"), ncu_control
             )
             write_text(workdir / "runner_stdout.log", out)
             write_text(workdir / "runner_stderr.log", err)
@@ -1006,7 +1056,7 @@ def worker_main(control_path: str) -> int:
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
                 "ptx_path": str(workdir / "kernel.ptx"),
-                "ncu_report_path": None
+                "ncu_report_path": ncu_report_path
             }
             json_dump(outj, workdir / "result.json")
             return 0
