@@ -52,9 +52,11 @@ if len(sys.argv) >= 2:
 
 import hashlib
 import importlib.util
+import shutil
+import subprocess
 import time
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 # Import from shared module for IOContract handling
 from shared.io_contract import IOContractManager
@@ -112,6 +114,112 @@ def find_triton_kernels(module: Any) -> List[Tuple[str, Any]]:
             kernels.append((name, obj))
 
     return kernels
+
+
+def _iter_asm_dicts(jit_func: Any) -> Iterable[Dict[str, Any]]:
+    """Yield asm dictionaries from Triton JIT caches (best-effort across versions)."""
+
+    def walk(node: Any):
+        if node is None:
+            return
+        if isinstance(node, dict):
+            for v in node.values():
+                yield from walk(v)
+            return
+        if isinstance(node, (list, tuple, set)):
+            for v in node:
+                yield from walk(v)
+            return
+
+        asm_dict = getattr(node, "asm", None)
+        if isinstance(asm_dict, dict):
+            yield asm_dict
+
+    for attr in ("cache", "_cache", "_caches"):
+        yield from walk(getattr(jit_func, attr, None))
+
+    # Fallback: try compiling directly
+    try:
+        import triton
+
+        signature = getattr(jit_func, "signature", None)
+        if signature:
+            compiled = triton.compiler.compile(
+                jit_func.fn,
+                signature=signature,
+                device="cuda",
+            )
+            asm_dict = getattr(compiled, "asm", None)
+            if isinstance(asm_dict, dict):
+                yield asm_dict
+    except Exception:
+        # Ignore compile failures; just skip asm extraction
+        return
+
+
+def _normalize_asm_blob(blob: Any) -> str:
+    if blob is None:
+        return ""
+    if isinstance(blob, (bytes, bytearray)):
+        return blob.decode("utf-8", errors="ignore")
+    return str(blob)
+
+
+def _write_triton_asm(jit_func: Any, ptx_path: Path, sass_path: Path) -> Tuple[bool, bool]:
+    """Attempt to write PTX and SASS from compiled Triton artifacts."""
+
+    ptx_written = False
+    sass_written = False
+
+    for asm_dict in _iter_asm_dicts(jit_func):
+        if not ptx_written:
+            ptx = asm_dict.get("ptx") or asm_dict.get("ptx+source")
+            if ptx:
+                ptx_path.write_text(_normalize_asm_blob(ptx), encoding="utf-8")
+                ptx_written = True
+
+        if not sass_written:
+            sass = asm_dict.get("sass")
+            if sass:
+                sass_path.write_text(_normalize_asm_blob(sass), encoding="utf-8")
+                sass_written = True
+            else:
+                cubin_blob = asm_dict.get("cubin")
+                if cubin_blob:
+                    tmp_cubin = sass_path.with_suffix(".cubin")
+                    try:
+                        tmp_cubin.write_bytes(
+                            cubin_blob if isinstance(cubin_blob, (bytes, bytearray)) else str(cubin_blob).encode("utf-8")
+                        )
+                        nvdisasm = shutil.which("nvdisasm") or shutil.which("cuobjdump")
+                        if nvdisasm:
+                            if "nvdisasm" in nvdisasm:
+                                proc = subprocess.run([nvdisasm, str(tmp_cubin)], capture_output=True, text=True)
+                            else:
+                                proc = subprocess.run([nvdisasm, "--dump-sass", str(tmp_cubin)], capture_output=True, text=True)
+                            sass_path.write_text(
+                                proc.stdout if proc.returncode == 0 else f"disasm failed: {proc.stderr}",
+                                encoding="utf-8",
+                            )
+                            sass_written = True
+                        else:
+                            sass_path.write_text("// SASS unavailable (nvdisasm/cuobjdump missing)", encoding="utf-8")
+                            sass_written = True
+                    finally:
+                        try:
+                            tmp_cubin.unlink()
+                        except Exception:
+                            pass
+
+        if ptx_written and sass_written:
+            break
+
+    if not ptx_written:
+        ptx_path.write_text("// PTX not captured", encoding="utf-8")
+    if not sass_written:
+        sass_path.write_text("// SASS not captured", encoding="utf-8")
+
+    return ptx_written, sass_written
 
 
 def generate_inputs_from_io_contract(io_contract: Dict[str, Any], device) -> Tuple[List[Any], Any]:
@@ -191,6 +299,8 @@ def run_kernel_io_contract_mode(
 
     # Load kernel module
     kernel_path = Path(config["kernel_module_path"])
+    ptx_path = Path(config.get("ptx_path", kernel_path.with_name("kernel.ptx")))
+    sass_path = Path(config.get("sass_path", kernel_path.with_name("kernel.sass")))
     kernel_name = config.get("kernel_name")
     timing = config["timing"]
     launch_update = config.get("launch_update", {})
@@ -208,7 +318,6 @@ def run_kernel_io_contract_mode(
             "launch_update_applied": False
         }
 
-    # Find @triton.jit kernels
     kernels = find_triton_kernels(module)
 
     if not kernels:
@@ -313,12 +422,25 @@ def run_kernel_io_contract_mode(
         "ok": bool(ok),
         "mean_ms": mean_ms,
         "std_ms": std_ms,
-        "launch_update_applied": True
+        "launch_update_applied": True,
+        "ptx_path": str(ptx_path),
+        "sass_path": str(sass_path)
     }
 
     if error_msg:
         result["error"] = error_msg
         result["traceback"] = error_tb
+
+    if jit_func is not None:
+        try:
+            ptx_ok, sass_ok = _write_triton_asm(jit_func, ptx_path, sass_path)
+            result["ptx_written"] = bool(ptx_ok)
+            result["sass_written"] = bool(sass_ok)
+        except Exception as e:  # pragma: no cover - best effort logging
+            result["asm_error"] = str(e)
+    else:
+        ptx_path.write_text("// PTX not captured", encoding="utf-8")
+        sass_path.write_text("// SASS not captured", encoding="utf-8")
 
     return result
 
@@ -337,6 +459,8 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
         use_events = False
 
     kernel_path = Path(config["kernel_module_path"])
+    ptx_path = Path(config.get("ptx_path", kernel_path.with_name("kernel.ptx")))
+    sass_path = Path(config.get("sass_path", kernel_path.with_name("kernel.sass")))
     invocation = config.get("invocation_example", "")
     timing = config["timing"]
     launch_update = config.get("launch_update", {})
@@ -362,6 +486,9 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
             "traceback": traceback.format_exc(),
             "launch_update_applied": False
         }
+
+    kernels = find_triton_kernels(module)
+    jit_func = kernels[0][1] if kernels else None
 
     # Check if LAUNCH_UPDATE is used in invocation
     uses_update = "LAUNCH_UPDATE" in invocation
@@ -414,12 +541,27 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
     mean_ms = float(sum(times) / len(times))
     std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5)
 
-    return {
+    result = {
         "ok": bool(ok),
         "mean_ms": mean_ms,
         "std_ms": std_ms,
-        "launch_update_applied": bool(uses_update)
+        "launch_update_applied": bool(uses_update),
+        "ptx_path": str(ptx_path),
+        "sass_path": str(sass_path)
     }
+
+    if jit_func is not None:
+        try:
+            ptx_ok, sass_ok = _write_triton_asm(jit_func, ptx_path, sass_path)
+            result["ptx_written"] = bool(ptx_ok)
+            result["sass_written"] = bool(sass_ok)
+        except Exception as e:  # pragma: no cover - best effort logging
+            result["asm_error"] = str(e)
+    else:
+        ptx_path.write_text("// PTX not captured", encoding="utf-8")
+        sass_path.write_text("// SASS not captured", encoding="utf-8")
+
+    return result
 
 
 def main() -> int:
