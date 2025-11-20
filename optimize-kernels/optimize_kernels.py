@@ -449,12 +449,18 @@ class Orchestrator:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.gpus[0]
 
+        representative_shapes = [
+            rs.to_dict() if hasattr(rs, "to_dict") else rs for rs in (k.representative_shapes or [])
+        ]
+
         control = {
             "kernel": k.to_dict(),
             "variant": {"full_source_code": k.source_code, "patch": {"files": []}, "launch_update": {}},
             "workdir": str(bdir),
             "ncu": {"enabled": True, "collect": True},
             "timing": DEFAULT_TIMING,
+            "timing_aggregation": k.timing_aggregation,
+            "representative_shapes": representative_shapes,
         }
         json_dump(control, bdir / "control.json")
 
@@ -677,12 +683,18 @@ class Orchestrator:
             vdir = self.kernel_dir(k) / "variants" / job_id
             vdir.mkdir(parents=True, exist_ok=True)
 
+            representative_shapes = [
+                rs.to_dict() if hasattr(rs, "to_dict") else rs for rs in (k.representative_shapes or [])
+            ]
+
             control = {
                 "kernel": k.to_dict(),
                 "variant": prop,
                 "workdir": str(vdir),
                 "ncu": {"enabled": True, "collect": True},
                 "timing": DEFAULT_TIMING,
+                "timing_aggregation": k.timing_aggregation,
+                "representative_shapes": representative_shapes,
                 "base_source_code": leaf_ns.source_code,
             }
             json_dump(control, vdir / "control.json")
@@ -809,8 +821,13 @@ class Orchestrator:
                     code = c.get("code","") or ""
                     is_diff = code.startswith("--- ") or "+++" in code or code.startswith("diff --git")
                     return {"patch":{"files":[{"diff":code}]}} if is_diff else {"full_source_code":code}
+                representative_shapes = [
+                    rs.to_dict() if hasattr(rs, "to_dict") else rs for rs in (k.representative_shapes or [])
+                ]
                 control2 = {"kernel": k.to_dict(), "variant": _to_variant(cand), "workdir": str(vdir2),
                             "ncu":{"enabled": True, "collect": True}, "timing": DEFAULT_TIMING,
+                            "timing_aggregation": k.timing_aggregation,
+                            "representative_shapes": representative_shapes,
                             "base_source_code": cur_ns.source_code}
                 json_dump(control2, vdir2 / "control.json")
                 env2 = os.environ.copy(); env2["CUDA_VISIBLE_DEVICES"] = self.gpus[(steps_taken + gpu_rr) % len(self.gpus)]
@@ -911,6 +928,8 @@ def worker_main(control_path: str) -> int:
         variant = control.get("variant", {}) or {}
         workdir = Path(control["workdir"])
         timing = control.get("timing", DEFAULT_TIMING)
+        timing_aggregation = control.get("timing_aggregation", k.timing_aggregation or "weighted_mean")
+        representative_shapes = control.get("representative_shapes", [])
         ncu_control = control.get("ncu", {}) or {}
         base_source_code = control.get("base_source_code", k.source_code)
         launch_update = variant.get("launch_update", {}) or {}
@@ -955,6 +974,8 @@ def worker_main(control_path: str) -> int:
                 "launch_update": launch_update,
                 "io_contract": k.io.to_dict() if k.io else {},
                 "timing": timing,
+                "timing_aggregation": timing_aggregation,
+                "representative_shapes": representative_shapes,
                 "result_path": str((workdir / "runner_result.json").resolve())
             }
             json_dump(runner_config, workdir / "runner_config.json")
@@ -993,6 +1014,8 @@ def worker_main(control_path: str) -> int:
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
+                "aggregation": r.get("aggregation"),
+                "shape_results": r.get("shape_results", []),
                 "ptx_path": str(ptx_path),
                 "ncu_report_path": ncu_report_path
             }
@@ -1061,6 +1084,9 @@ def worker_main(control_path: str) -> int:
                 "kernel_name": get_metadata_value(k.metadata, "kernel_name", "kernel"),
                 "io_contract": effective_io or {},
                 "timing": timing,
+                "timing_aggregation": timing_aggregation,
+                "representative_shapes": representative_shapes,
+                "launch_update": launch_update,
                 "result_path": str((workdir / "runner_result.json").resolve())
             }
             json_dump(runner_config, workdir / "runner_config.json")
@@ -1094,6 +1120,8 @@ def worker_main(control_path: str) -> int:
                 "state_hash": final_state_hash,
                 "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
                 "materialized_source": materialized_source,
+                "aggregation": r.get("aggregation"),
+                "shape_results": r.get("shape_results", []),
                 "ptx_path": str(workdir / "kernel.ptx"),
                 "ncu_report_path": ncu_report_path
             }
