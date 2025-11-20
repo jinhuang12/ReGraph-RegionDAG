@@ -171,6 +171,9 @@ def _write_triton_asm(jit_func: Any, ptx_path: Path, sass_path: Path) -> Tuple[b
     ptx_written = False
     sass_written = False
 
+    ptx_path.parent.mkdir(parents=True, exist_ok=True)
+    sass_path.parent.mkdir(parents=True, exist_ok=True)
+
     for asm_dict in _iter_asm_dicts(jit_func):
         if not ptx_written:
             ptx = asm_dict.get("ptx") or asm_dict.get("ptx+source")
@@ -318,9 +321,6 @@ def run_kernel_io_contract_mode(
             "launch_update_applied": False
         }
 
-    kernels = find_triton_kernels(module)
-    jit_func = kernels[0][1] if kernels else None
-
     # Find @triton.jit kernels
     kernels = find_triton_kernels(module)
 
@@ -443,7 +443,9 @@ def run_kernel_io_contract_mode(
         except Exception as e:  # pragma: no cover - best effort logging
             result["asm_error"] = str(e)
     else:
+        ptx_path.parent.mkdir(parents=True, exist_ok=True)
         ptx_path.write_text("// PTX not captured", encoding="utf-8")
+        sass_path.parent.mkdir(parents=True, exist_ok=True)
         sass_path.write_text("// SASS not captured", encoding="utf-8")
 
     return result
@@ -490,6 +492,9 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
             "traceback": traceback.format_exc(),
             "launch_update_applied": False
         }
+
+    kernels = find_triton_kernels(module)
+    jit_func = kernels[0][1] if kernels else None
 
     # Check if LAUNCH_UPDATE is used in invocation
     uses_update = "LAUNCH_UPDATE" in invocation
@@ -551,12 +556,18 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
         "sass_path": str(sass_path)
     }
 
-    try:
-        ptx_ok, sass_ok = _write_triton_asm(jit_func, ptx_path, sass_path)
-        result["ptx_written"] = bool(ptx_ok)
-        result["sass_written"] = bool(sass_ok)
-    except Exception as e:  # pragma: no cover - best effort logging
-        result["asm_error"] = str(e)
+    if jit_func is not None:
+        try:
+            ptx_ok, sass_ok = _write_triton_asm(jit_func, ptx_path, sass_path)
+            result["ptx_written"] = bool(ptx_ok)
+            result["sass_written"] = bool(sass_ok)
+        except Exception as e:  # pragma: no cover - best effort logging
+            result["asm_error"] = str(e)
+    else:
+        ptx_path.parent.mkdir(parents=True, exist_ok=True)
+        ptx_path.write_text("// PTX not captured", encoding="utf-8")
+        sass_path.parent.mkdir(parents=True, exist_ok=True)
+        sass_path.write_text("// SASS not captured", encoding="utf-8")
 
     return result
 
