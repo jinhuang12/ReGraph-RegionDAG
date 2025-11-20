@@ -62,7 +62,7 @@ USE_HASH_FOR_NODE_ID = True
 
 MAX_DEPTH = 8
 PW_K0, PW_K1, PW_ALPHA = 2, 3, 0.5
-DEFAULT_TIMING = {"warmup": 10, "iters": 100, "repeat": 3}
+DEFAULT_TIMING = {"warmup": 10, "iters": 100, "repeat": 3, "trim_ratio": 0.2}
 COMPILE_CACHE_DIR = Path(os.environ.get("COMPILE_CACHE_DIR", "/tmp/kernel_compile_cache"))
 
 

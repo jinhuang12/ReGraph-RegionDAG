@@ -473,6 +473,7 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
     kernel_path = Path(config["kernel_module_path"])
     invocation = config.get("invocation_example", "")
     timing = config["timing"]
+    trim_ratio = float(timing.get("trim_ratio", 0.2))
     launch_update = config.get("launch_update", {})
 
     if not invocation:

@@ -324,6 +324,7 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
     kernel_name = config.get("kernel_name", "kernel")
     io_contract = config["io_contract"]
     timing = config["timing"]
+    trim_ratio = float(timing.get("trim_ratio", 0.2))
 
     try:
         # Load CUDA module
