@@ -43,7 +43,10 @@ if len(sys.argv) >= 2:
     except Exception:
         pass  # Fallback to PYTHONPATH
 
+import importlib
+import math
 import traceback
+from itertools import accumulate
 from typing import Any, Dict, List, Tuple
 
 
@@ -51,6 +54,268 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """Load runner configuration from JSON file."""
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _resolve_attr_path(path: str) -> Any:
+    """Resolve dotted import/attribute path to a callable/object."""
+    parts = path.split(".")
+    if not parts:
+        raise ValueError("Empty path")
+    module = importlib.import_module(parts[0])
+    obj = module
+    for part in parts[1:]:
+        obj = getattr(obj, part)
+    return obj
+
+
+def _build_flash_attention_inputs(case: Dict[str, Any], torch: Any, device: Any) -> Tuple[List[Any], Dict[str, Any]]:
+    """Create packed varlen flash attention inputs for vLLM kernels."""
+    seqlens: List[int] = case.get("seqlens") or []
+    batch = len(seqlens)
+    if batch == 0:
+        batch = int(case.get("batch", 1))
+        seqlen = int(case.get("seq_len", 1024))
+        seqlens = [seqlen for _ in range(batch)]
+
+    num_heads = int(case.get("num_heads", 32))
+    head_dim = int(case.get("head_dim", 128))
+    dtype_str = case.get("dtype", "float16")
+    dtype = getattr(torch, dtype_str)
+    seed = case.get("seed")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    total_tokens = sum(seqlens)
+    qkv = torch.randn((total_tokens, 3, num_heads, head_dim), device=device, dtype=dtype)
+    cu_seqlens = torch.tensor([0, *accumulate(seqlens)], device=device, dtype=torch.int32)
+    max_seqlen = int(max(seqlens))
+    scale = float(case.get("softmax_scale", 1.0 / math.sqrt(head_dim)))
+    causal = bool(case.get("causal", True))
+
+    # torch.ops.vllm.flash_attn_varlen_qkvpacked signature matches these args
+    inputs = [qkv, cu_seqlens, max_seqlen, scale, False, causal]
+    return inputs, {}
+
+
+def _flash_attention_reference(
+    inputs: List[Any],
+    ref_fn: Any,
+    torch: Any,
+) -> Any:
+    """Compute reference output for flash attention."""
+    if ref_fn is not None:
+        try:
+            return ref_fn(*inputs)
+        except Exception:
+            pass
+
+    # Fallback: use scaled_dot_product_attention on padded tensors
+    qkv, cu_seqlens, max_seqlen, scale, _dropout, causal = inputs
+    num_heads = qkv.shape[2]
+    head_dim = qkv.shape[3]
+    batch = cu_seqlens.numel() - 1
+    device = qkv.device
+    dtype = qkv.dtype
+
+    qkv_padded = torch.zeros(
+        (batch, max_seqlen, 3, num_heads, head_dim), device=device, dtype=dtype
+    )
+    for b in range(batch):
+        start = int(cu_seqlens[b])
+        end = int(cu_seqlens[b + 1])
+        seqlen = end - start
+        qkv_padded[b, :seqlen] = qkv[start:end]
+
+    q = qkv_padded[:, :, 0]
+    k = qkv_padded[:, :, 1]
+    v = qkv_padded[:, :, 2]
+    attn_mask = None
+    if causal:
+        attn_mask = torch.full(
+            (batch, 1, max_seqlen, max_seqlen),
+            float("-inf"),
+            device=device,
+            dtype=torch.float32,
+        )
+        attn_mask = torch.triu(attn_mask, diagonal=1)
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        attn_mask=attn_mask, scale=scale
+    )
+    out = out.transpose(1, 2)
+    flat = torch.zeros((qkv.shape[0], num_heads, head_dim), device=device, dtype=dtype)
+    for b in range(batch):
+        start = int(cu_seqlens[b])
+        end = int(cu_seqlens[b + 1])
+        seqlen = end - start
+        flat[start:end] = out[b, :seqlen]
+    return flat
+
+
+def _build_rms_norm_inputs(case: Dict[str, Any], torch: Any, device: Any) -> Tuple[List[Any], Dict[str, Any]]:
+    shape = case.get("shape") or [case.get("batch", 1), case.get("seq_len", 2048), case.get("hidden", 4096)]
+    shape = [int(x) for x in shape]
+    dtype_str = case.get("dtype", "float16")
+    dtype = getattr(torch, dtype_str)
+    seed = case.get("seed")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    x = torch.randn(shape, device=device, dtype=dtype)
+    weight = torch.randn((shape[-1],), device=device, dtype=dtype)
+    eps = float(case.get("eps", 1e-6))
+    return [x, weight, eps], {}
+
+
+def _rms_norm_reference(inputs: List[Any], torch: Any) -> Any:
+    x, weight, eps = inputs
+    variance = torch.mean(x * x, dim=-1, keepdim=True)
+    inv_rms = torch.rsqrt(variance + eps)
+    return (x * inv_rms) * weight
+
+
+def run_vllm_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute built-in vLLM kernels with reference comparison."""
+    try:
+        import vllm  # noqa: F401
+        import torch
+    except Exception as e:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": f"vLLM path unavailable: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+    if not torch.cuda.is_available():
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": "CUDA device not available for vLLM kernels",
+        }
+
+    op_name = config.get("op_name") or ""
+    entry_path = config.get("entry_path")
+    reference_path = config.get("reference_path")
+    cases = config.get("cases", []) or []
+    timing = config.get("timing", {"warmup": 1, "iters": 10, "repeat": 1})
+    seed = config.get("seed")
+
+    try:
+        entry_fn = _resolve_attr_path(entry_path) if entry_path else None
+        ref_fn = _resolve_attr_path(reference_path) if reference_path else None
+    except Exception as e:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": f"Failed to resolve vLLM callables: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+    if entry_fn is None:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": "No vLLM entry function provided",
+        }
+
+    device = torch.device("cuda")
+    dtype_default = config.get("dtype", "float16")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    times: List[float] = []
+    max_diff = 0.0
+    ok = True
+
+    for case in cases:
+        case = dict(case)
+        case.setdefault("dtype", dtype_default)
+        if op_name == "flash_attention":
+            inputs, kwargs = _build_flash_attention_inputs(case, torch, device)
+            reference = lambda: _flash_attention_reference(inputs, ref_fn, torch)
+        elif op_name == "rms_norm":
+            inputs, kwargs = _build_rms_norm_inputs(case, torch, device)
+            reference = lambda: _rms_norm_reference(inputs, torch)
+        else:
+            return {
+                "ok": False,
+                "mean_ms": float("inf"),
+                "std_ms": 0.0,
+                "error": f"Unsupported vLLM op_name {op_name}",
+            }
+
+        try:
+            for _ in range(timing.get("warmup", 0)):
+                entry_fn(*inputs, **kwargs)
+            torch.cuda.synchronize()
+        except Exception as e:
+            return {
+                "ok": False,
+                "mean_ms": float("inf"),
+                "std_ms": 0.0,
+                "error": f"vLLM kernel warmup failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+        try:
+            case_times = []
+            for _ in range(timing.get("repeat", 1)):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                accum = 0.0
+                for _ in range(timing.get("iters", 1)):
+                    start.record()
+                    out = entry_fn(*inputs, **kwargs)
+                    end.record()
+                    end.synchronize()
+                    accum += float(start.elapsed_time(end))
+                case_times.append(accum / max(timing.get("iters", 1), 1))
+
+            times.append(sum(case_times) / len(case_times))
+
+            ref_out = reference()
+            if isinstance(out, tuple):
+                out = out[0]
+            if isinstance(ref_out, tuple):
+                ref_out = ref_out[0]
+
+            diff = torch.max(torch.abs(out - ref_out)).item()
+            max_diff = max(max_diff, diff)
+            if not torch.isfinite(torch.tensor(diff)):
+                ok = False
+            if diff > float(config.get("tolerance", 1e-3)):
+                ok = False
+        except Exception as e:
+            return {
+                "ok": False,
+                "mean_ms": float("inf"),
+                "std_ms": 0.0,
+                "error": f"vLLM kernel execution failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    if not times:
+        return {
+            "ok": False,
+            "mean_ms": float("inf"),
+            "std_ms": 0.0,
+            "error": "No vLLM cases executed",
+        }
+
+    mean_ms = float(sum(times) / len(times))
+    std_ms = float(math.sqrt(sum((t - mean_ms) ** 2 for t in times) / len(times)))
+    return {
+        "ok": bool(ok),
+        "mean_ms": mean_ms,
+        "std_ms": std_ms,
+        "max_diff": max_diff,
+    }
 
 
 def make_tensor(arg: Dict[str, Any], cp: Any) -> Any:
@@ -219,6 +484,9 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Result dict with timing and status
     """
+    if config.get("mode") == "vllm":
+        return run_vllm_kernel(config)
+
     try:
         import cupy as cp
         import numpy as np

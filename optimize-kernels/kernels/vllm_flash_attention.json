@@ -1,0 +1,50 @@
+{
+  "name": "vllm_flash_attention",
+  "kernel": {
+    "kernel_type": "cuda",
+    "source_code": "// vLLM built-in flash attention kernel (torch.ops.vllm.flash_attn_varlen_qkvpacked)\n",
+    "metadata": {
+      "kernel_name": "flash_attn_varlen_qkvpacked",
+      "runner_mode": "vllm",
+      "vllm": {
+        "op_name": "flash_attention",
+        "entry_path": "torch.ops.vllm.flash_attn_varlen_qkvpacked",
+        "reference_path": "vllm.attention.ops.flash_attn.varlen_flash_attn",
+        "shape_distribution": [
+          {
+            "batch": 1,
+            "seq_len": 2048,
+            "num_heads": 32,
+            "head_dim": 128,
+            "dtype": "float16",
+            "seed": 1,
+            "causal": true
+          },
+          {
+            "seqlens": [4096, 3072],
+            "num_heads": 24,
+            "head_dim": 128,
+            "dtype": "float16",
+            "seed": 2,
+            "causal": true,
+            "softmax_scale": 0.088
+          },
+          {
+            "seqlens": [8192],
+            "num_heads": 16,
+            "head_dim": 64,
+            "dtype": "bfloat16",
+            "seed": 3,
+            "causal": false
+          }
+        ],
+        "dtype": "float16",
+        "seed": 123
+      }
+    },
+    "io": {
+      "args": [],
+      "launch": null
+    }
+  }
+}
