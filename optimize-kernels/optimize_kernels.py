@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from workers.state_manager import save_partial_state, load_partial_state, get_latest_phase_data
 from shared.model import DeviceProfile, KernelCode, _round_float_values, get_metadata_value
 # --- Tools (LLM + Region-DAG + NCU) ---
+import kernel_opt_tooling
 from kernel_opt_tooling import LLMCandidateGenerator, RegionDagContext, NcuMetricsContext, PtxSourceCorrelator
 
 # --------------------------- Constants & Config --------------------------
@@ -454,6 +455,36 @@ class Orchestrator:
         budget = int(self.args.budget_builds)
         gpu_rr = 0
 
+        def _prepare_contexts(ns: NodeStats) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            region_summary: Dict[str, Any] = {}
+            ncu_summary: Dict[str, Any] = {}
+
+            # Clear existing globals before populating for this node
+            kernel_opt_tooling.CURRENT_REGION_DAG_CTX = None
+            kernel_opt_tooling.CURRENT_NCU_CTX = None
+            kernel_opt_tooling.CURRENT_PTX_CORRELATOR = None
+
+            rctx: Optional[RegionDagContext] = None
+            nctx: Optional[NcuMetricsContext] = None
+            ptx_corr: Optional[PtxSourceCorrelator] = None
+            try:
+                if ns.ptx_path and Path(ns.ptx_path).exists():
+                    rctx = RegionDagContext(Path(ns.ptx_path).read_text(encoding="utf-8"), kernel_name=k.name)
+                    region_summary = rctx.overview()
+                if ns.ncu_report_path and Path(ns.ncu_report_path).exists():
+                    nctx = NcuMetricsContext(ns.ncu_report_path, range_idx=0, action_idx=0)
+                    ncu_summary = nctx.summary()
+                    ptx_corr = PtxSourceCorrelator(ns.ncu_report_path)
+                kernel_opt_tooling.CURRENT_REGION_DAG_CTX = rctx
+                kernel_opt_tooling.CURRENT_NCU_CTX = nctx
+                kernel_opt_tooling.CURRENT_PTX_CORRELATOR = ptx_corr
+            except Exception:
+                kernel_opt_tooling.CURRENT_REGION_DAG_CTX = None
+                kernel_opt_tooling.CURRENT_NCU_CTX = None
+                kernel_opt_tooling.CURRENT_PTX_CORRELATOR = None
+
+            return region_summary, ncu_summary
+
         while budget > 0:
             path: List[Tuple[str, str]] = []  # (state_hash, action_id)
             s = root_hash
@@ -513,17 +544,7 @@ class Orchestrator:
             leaf_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in leaf_ns.edges.items()}
 
             # ------ Expansion on first visit ------
-            region_summary = {}
-            ncu_summary = {}
-            try:
-                if leaf_ns.ptx_path and Path(leaf_ns.ptx_path).exists():
-                    rctx = RegionDagContext(Path(leaf_ns.ptx_path).read_text(encoding="utf-8"), kernel_name="kernel")
-                    region_summary = rctx.overview()
-                if leaf_ns.ncu_report_path and Path(leaf_ns.ncu_report_path).exists():
-                    nctx = NcuMetricsContext(leaf_ns.ncu_report_path, range_idx=0, action_idx=0)
-                    ncu_summary = nctx.summary()
-            except Exception:
-                pass
+            region_summary, ncu_summary = _prepare_contexts(leaf_ns)
 
             if not leaf_ns.edges:
                 # Ask LLM for proposals (region/NCU summaries optional)
@@ -684,11 +705,12 @@ class Orchestrator:
                 # First visit? expand all successors
                 if not cur_ns.edges:
                     # Ask LLM and relabel
+                    region_summary, ncu_summary = _prepare_contexts(cur_ns)
                     props_obj = None
                     try:
-                        props_obj = self.llm.propose(k, region_summary={}, ncu_summary={})
+                        props_obj = self.llm.propose(k, region_summary=region_summary, ncu_summary=ncu_summary)
                     except TypeError:
-                        props_obj = self.llm.propose(k, region_summary={})
+                        props_obj = self.llm.propose(k, region_summary=region_summary)
                     candlist = relabel_methods(self, search_state, props_obj.get("candidates", []) if props_obj else [])
 
                     # ReGraph constraint for rollout node
