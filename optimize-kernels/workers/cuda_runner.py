@@ -235,6 +235,7 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
     kernel_name = config.get("kernel_name", "kernel")
     io_contract = config["io_contract"]
     timing = config["timing"]
+    reference_cfg = config.get("reference")
 
     try:
         # Load CUDA module
@@ -321,9 +322,16 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
             "traceback": traceback.format_exc()
         }
 
-    # Calculate statistics
-    mean_ms = float(np.mean(times))
-    std_ms = float(np.std(times))
+    # Calculate robust statistics
+    mean_ms = float(np.mean(times)) if times else float("inf")
+    std_ms = float(np.std(times)) if times else 0.0
+    min_ms = float(np.min(times)) if times else float("inf")
+    median_ms = float(np.median(times)) if times else float("inf")
+    if len(times) >= 3:
+        trimmed = np.sort(np.array(times))[1:-1]  # drop min/max
+        trimmed_mean_ms = float(np.mean(trimmed)) if trimmed.size else mean_ms
+    else:
+        trimmed_mean_ms = mean_ms
 
     # Validate outputs (check for NaN/Inf)
     ok = True
@@ -335,11 +343,78 @@ def run_cuda_kernel(config: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass  # Validation failure doesn't crash the runner
 
-    return {
+    # Optional correctness check against Python reference
+    correctness_error = None
+    if ok and reference_cfg:
+        try:
+            import importlib.util
+            import numpy as np
+
+            ref_mod_path = reference_cfg.get("module")
+            ref_func_name = reference_cfg.get("function", "reference")
+            rtol = float(reference_cfg.get("rtol", 1e-3))
+            atol = float(reference_cfg.get("atol", 1e-4))
+
+            if ref_mod_path:
+                if Path(ref_mod_path).exists():
+                    spec = importlib.util.spec_from_file_location("ref_mod", ref_mod_path)
+                    ref_mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(ref_mod)  # type: ignore
+                else:
+                    ref_mod = importlib.import_module(ref_mod_path)
+            else:
+                ref_mod = None
+
+            ref_fn = getattr(ref_mod, ref_func_name) if ref_mod else None
+            if ref_fn is None:
+                raise RuntimeError("reference function not found")
+
+            # build numpy inputs matching contract
+            np_inputs = []
+            for a, spec in zip(args, io_contract.get("args", [])):
+                if spec.get("type") == "tensor":
+                    np_inputs.append(cp.asnumpy(a))
+                else:
+                    np_inputs.append(a)
+
+            ref_out = ref_fn(*np_inputs)
+            # normalize outputs to tuple/list
+            if isinstance(ref_out, tuple) or isinstance(ref_out, list):
+                ref_outputs = list(ref_out)
+            elif ref_out is None:
+                ref_outputs = []
+            else:
+                ref_outputs = [ref_out]
+
+            # gather gpu outputs as numpy in order of output/inout roles
+            gpu_out_np = []
+            for arr, spec in zip(args, io_contract.get("args", [])):
+                if spec.get("type") == "tensor" and spec.get("role") in ("output", "inout"):
+                    gpu_out_np.append(cp.asnumpy(arr))
+
+            if len(ref_outputs) != len(gpu_out_np):
+                raise RuntimeError(f"reference returned {len(ref_outputs)} outputs, expected {len(gpu_out_np)}")
+
+            for exp, got in zip(ref_outputs, gpu_out_np):
+                if not np.allclose(exp, got, rtol=rtol, atol=atol, equal_nan=False):
+                    ok = False
+                    correctness_error = "reference_mismatch"
+                    break
+        except Exception as e:
+            ok = False
+            correctness_error = f"reference_failed: {e}"
+
+    result = {
         "ok": bool(ok),
         "mean_ms": mean_ms,
-        "std_ms": std_ms
+        "std_ms": std_ms,
+        "median_ms": median_ms,
+        "min_ms": min_ms,
+        "trimmed_mean_ms": trimmed_mean_ms
     }
+    if correctness_error:
+        result["error"] = correctness_error
+    return result
 
 
 def main() -> int:

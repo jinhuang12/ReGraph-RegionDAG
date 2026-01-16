@@ -1,0 +1,181 @@
+{
+  "kernel": {
+    "source_code": "import triton\nimport triton.language as tl\n\n\n\n@triton.jit\ndef matmul_kernel_2d(\n        # Pointers to matrices\n        a_ptr, b_ptr, c_ptr,\n        # Matrix dimensions\n        M, N, K,\n        # The stride variables represent how much to increase the ptr by when moving by 1\n        # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`\n        # by to get the element one row down (A has M rows).\n        stride_am, stride_ak,  #\n        stride_bk, stride_bn,  #\n        stride_cm, stride_cn,\n        # Meta-parameters\n        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #\n        GROUP_SIZE_M: tl.constexpr,  #\n):\n    \"\"\"Kernel for computing the matmul C = A x B.\n    A has shape (M, K), B has shape (K, N) and C has shape (M, N)\n    \"\"\"\n    # -----------------------------------------------------------\n    # Map program ids `pid` to the block of C it should compute.\n    # This is done in a grouped ordering to promote L2 data reuse.\n    # See above `L2 Cache Optimizations` section for details.\n    pid = tl.program_id(axis=0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    num_pid_in_group = GROUP_SIZE_M * num_pid_n\n    group_id = pid // num_pid_in_group\n    first_pid_m = group_id * GROUP_SIZE_M\n    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)\n    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)\n    pid_n = (pid % num_pid_in_group) // group_size_m\n\n    # -----------------------------------------------------------\n    # Add some integer bound assumptions.\n    # This helps to guide integer analysis in the backend to optimize\n    # load/store offset address calculation\n    tl.assume(pid_m >= 0)\n    tl.assume(pid_n >= 0)\n    tl.assume(stride_am > 0)\n    tl.assume(stride_ak > 0)\n    tl.assume(stride_bn > 0)\n    tl.assume(stride_bk > 0)\n    tl.assume(stride_cm > 0)\n    tl.assume(stride_cn > 0)\n\n    # ----------------------------------------------------------\n    # Create pointers for the first blocks of A and B.\n    # We will advance this pointer as we move in the K direction\n    # and accumulate\n    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers\n    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers\n    # See above `Pointer Arithmetic` section for details\n    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M\n    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n\n    # -----------------------------------------------------------\n    # Iterate to compute a block of the C matrix.\n    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block\n    # of fp32 values for higher accuracy.\n    # `accumulator` will be converted back to fp16 after the loop.\n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):\n        # Load the next block of A and B, generate a mask by checking the K dimension.\n        # If it is out of bounds, set it to 0.\n        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)\n        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)\n        # We accumulate along the K dimension.\n        accumulator = tl.dot(a, b, accumulator)\n        # Advance the ptrs to the next K block.\n        a_ptrs += BLOCK_SIZE_K * stride_ak\n        b_ptrs += BLOCK_SIZE_K * stride_bk\n\n    c = accumulator.to(tl.float16)\n\n    # -----------------------------------------------------------\n    # Write back the block of the output matrix C with masks.\n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]\n    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)\n    tl.store(c_ptrs, c, mask=c_mask)\n\n\ndef benchmark_kernel(contract_args: dict, warmup: int, iters: int, repeat: int) -> dict:\n    \"\"\"\n    Kernel-only timing for matmul_kernel_2d. Expects contract_args to include tensors\n    for a_ptr, b_ptr, c_ptr (as produced by build_benchmark_args) plus meta params.\n    \"\"\"\n    a = contract_args.get(\"a_ptr\")\n    b = contract_args.get(\"b_ptr\")\n    c = contract_args.get(\"c_ptr\")\n    if a is None or b is None:\n        raise ValueError(\"benchmark_kernel expects a_ptr and b_ptr tensors in contract_args\")\n    device = a.device\n    if c is None:\n        c = torch.empty((int(contract_args.get(\"M\", a.shape[0])), int(contract_args.get(\"N\", b.shape[1]))), device=device, dtype=a.dtype)\n\n    M = int(contract_args.get(\"M\", a.shape[0]))\n    N = int(contract_args.get(\"N\", b.shape[1]))\n    K = int(contract_args.get(\"K\", a.shape[1]))\n    stride_am = int(contract_args.get(\"stride_am\", a.stride(0)))\n    stride_ak = int(contract_args.get(\"stride_ak\", a.stride(1)))\n    stride_bk = int(contract_args.get(\"stride_bk\", b.stride(0)))\n    stride_bn = int(contract_args.get(\"stride_bn\", b.stride(1)))\n    stride_cm = int(contract_args.get(\"stride_cm\", c.stride(0)))\n    stride_cn = int(contract_args.get(\"stride_cn\", c.stride(1)))\n    BLOCK_SIZE_M = int(contract_args.get(\"BLOCK_SIZE_M\", 64))\n    BLOCK_SIZE_N = int(contract_args.get(\"BLOCK_SIZE_N\", 64))\n    BLOCK_SIZE_K = int(contract_args.get(\"BLOCK_SIZE_K\", 32))\n    GROUP_SIZE_M = int(contract_args.get(\"GROUP_SIZE_M\", 8))\n\n    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)\n\n    for _ in range(max(0, warmup)):\n        matmul_kernel_2d[grid](\n            a, b, c,\n            M, N, K,\n            stride_am, stride_ak,\n            stride_bk, stride_bn,\n            stride_cm, stride_cn,\n            BLOCK_SIZE_M=BLOCK_SIZE_M,\n            BLOCK_SIZE_N=BLOCK_SIZE_N,\n            BLOCK_SIZE_K=BLOCK_SIZE_K,\n            GROUP_SIZE_M=GROUP_SIZE_M,\n        )\n    if device.type == \"cuda\":\n        torch.cuda.synchronize()\n\n    times_ms = []\n    if device.type == \"cuda\" and torch.cuda.is_available():\n        start_evt = torch.cuda.Event(enable_timing=True)\n        end_evt = torch.cuda.Event(enable_timing=True)\n        for _ in range(repeat):\n            for _ in range(iters):\n                start_evt.record()\n                matmul_kernel_2d[grid](\n                    a, b, c,\n                    M, N, K,\n                    stride_am, stride_ak,\n                    stride_bk, stride_bn,\n                    stride_cm, stride_cn,\n                    BLOCK_SIZE_M=BLOCK_SIZE_M,\n                    BLOCK_SIZE_N=BLOCK_SIZE_N,\n                    BLOCK_SIZE_K=BLOCK_SIZE_K,\n                    GROUP_SIZE_M=GROUP_SIZE_M,\n                )\n                end_evt.record()\n                end_evt.synchronize()\n                times_ms.append(float(start_evt.elapsed_time(end_evt)))\n    else:\n        import time as _time\n\n        for _ in range(repeat):\n            for _ in range(iters):\n                t0 = _time.perf_counter()\n                matmul_kernel_2d[grid](\n                    a, b, c,\n                    M, N, K,\n                    stride_am, stride_ak,\n                    stride_bk, stride_bn,\n                    stride_cm, stride_cn,\n                    BLOCK_SIZE_M=BLOCK_SIZE_M,\n                    BLOCK_SIZE_N=BLOCK_SIZE_N,\n                    BLOCK_SIZE_K=BLOCK_SIZE_K,\n                    GROUP_SIZE_M=GROUP_SIZE_M,\n                )\n                t1 = _time.perf_counter()\n                times_ms.append((t1 - t0) * 1000.0)\n\n    import statistics\n\n    mean_ms = float(statistics.mean(times_ms)) if times_ms else float(\"inf\")\n    std_ms = float(statistics.pstdev(times_ms)) if len(times_ms) > 1 else 0.0\n\n    return {\n        \"ok\": torch.isfinite(torch.tensor(mean_ms)).item(),\n        \"mean_ms\": mean_ms,\n        \"std_ms\": std_ms,\n        \"output_summary\": {\n            \"shape\": list(c.shape),\n            \"dtype\": str(c.dtype),\n            \"min\": float(c.min().item()),\n            \"max\": float(c.max().item()),\n        },\n        \"output\": c,\n    }\n",
+    "kernel_type": "triton",
+    "metadata": {
+      "kernel_name": "matmul_kernel_2d"
+    },
+    "io": {
+      "args": [
+        {
+          "name": "a_ptr",
+          "type": "tensor",
+          "tensor_spec": {
+            "shape": [
+              1024,
+              512
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "seed": 42,
+              "mean": 0.0,
+              "std": 0.1
+            }
+          },
+          "role": "input",
+          "description": "Matrix A with shape [M, K] = [1024, 512]"
+        },
+        {
+          "name": "b_ptr",
+          "type": "tensor",
+          "tensor_spec": {
+            "shape": [
+              512,
+              1024
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "seed": 43,
+              "mean": 0.0,
+              "std": 0.1
+            }
+          },
+          "role": "input",
+          "description": "Matrix B with shape [K, N] = [512, 1024]"
+        },
+        {
+          "name": "c_ptr",
+          "type": "tensor",
+          "tensor_spec": {
+            "shape": [
+              1024,
+              1024
+            ],
+            "dtype": "float16"
+          },
+          "role": "output",
+          "description": "Output matrix C with shape [M, N] = [1024, 1024]"
+        },
+        {
+          "name": "M",
+          "type": "int",
+          "value": 1024,
+          "role": "input",
+          "description": "Number of rows in matrix A and C"
+        },
+        {
+          "name": "N",
+          "type": "int",
+          "value": 1024,
+          "role": "input",
+          "description": "Number of columns in matrix B and C"
+        },
+        {
+          "name": "K",
+          "type": "int",
+          "value": 512,
+          "role": "input",
+          "description": "Inner dimension - columns in A, rows in B"
+        },
+        {
+          "name": "stride_am",
+          "type": "int",
+          "value": 512,
+          "role": "input",
+          "description": "Stride for matrix A dimension 0 (rows): K = 512"
+        },
+        {
+          "name": "stride_ak",
+          "type": "int",
+          "value": 1,
+          "role": "input",
+          "description": "Stride for matrix A dimension 1 (columns): 1"
+        },
+        {
+          "name": "stride_bk",
+          "type": "int",
+          "value": 1024,
+          "role": "input",
+          "description": "Stride for matrix B dimension 0 (rows): N = 1024"
+        },
+        {
+          "name": "stride_bn",
+          "type": "int",
+          "value": 1,
+          "role": "input",
+          "description": "Stride for matrix B dimension 1 (columns): 1"
+        },
+        {
+          "name": "stride_cm",
+          "type": "int",
+          "value": 1024,
+          "role": "input",
+          "description": "Stride for matrix C dimension 0 (rows): N = 1024"
+        },
+        {
+          "name": "stride_cn",
+          "type": "int",
+          "value": 1,
+          "role": "input",
+          "description": "Stride for matrix C dimension 1 (columns): 1"
+        },
+        {
+          "name": "BLOCK_SIZE_M",
+          "type": "int",
+          "value": 64,
+          "is_meta": true,
+          "role": "input",
+          "description": "Block size for M dimension"
+        },
+        {
+          "name": "BLOCK_SIZE_N",
+          "type": "int",
+          "value": 64,
+          "is_meta": true,
+          "role": "input",
+          "description": "Block size for N dimension"
+        },
+        {
+          "name": "BLOCK_SIZE_K",
+          "type": "int",
+          "value": 32,
+          "is_meta": true,
+          "role": "input",
+          "description": "Block size for K dimension"
+        },
+        {
+          "name": "GROUP_SIZE_M",
+          "type": "int",
+          "value": 8,
+          "is_meta": true,
+          "role": "input",
+          "description": "Group size for M dimension to promote L2 cache reuse"
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 256
+        },
+        "num_warps": 4,
+        "num_stages": 3
+      }
+    }
+  },
+  "num_trials": 50,
+  "timeout": 180,
+  "description": "KernelsForIronFist - 2D Matrix Multiplication kernel using Triton with optimized memory access patterns",
+  "notes": [
+    "1. Matrix dimensions: A[1024, 512] \u00d7 B[512, 1024] = C[1024, 1024]",
+    "2. Block sizes: BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 for good performance",
+    "3. GROUP_SIZE_M=8 for L2 cache optimization",
+    "4. Grid size: cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N) = 16 * 16 = 256 blocks",
+    "5. Uses fp32 accumulation for higher accuracy, converts to fp16 for output",
+    "6. Proper stride calculations for contiguous memory layout",
+    "7. Includes masking for boundary conditions",
+    "8. Based on standard Triton matmul tutorial implementation",
+    "9. Should show measurable runtime for matrix multiplication workload"
+  ],
+  "name": "matmul_kernel_2d_contract"
+}

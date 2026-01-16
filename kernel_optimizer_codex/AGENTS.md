@@ -90,7 +90,7 @@ python tools/init_kernels_and_suites.py \
   --contracts-subdir ironfist \
   --kernels-dir kernels \
   --suites-dir suites
-````
+```
 
 Run this:
 
@@ -118,12 +118,16 @@ Run this:
 
 **Typical usage**
 
+> Tip: for hash-suffixed kernel modules, use the suite’s `kernel_name` field.
+> Example: `suites/ironfist/gemm_split_k_kernel_suite.json` → `kernel_name: gemm_split_k_kernel_a4a9473a`
+> so the module is `kernels/ironfist/gemm_split_k_kernel_a4a9473a.py` and runs are under `runs/gemm_split_k_kernel_a4a9473a/...`.
+
 Baseline:
 
 ```bash
 python tools/profile_suite.py \
   --suite suites/ironfist/gemm_split_k_kernel_suite.json \
-  --module kernels/ironfist/gemm_split_k_kernel.py \
+  --module kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --device cuda:0 \
   --tag baseline \
   --warmup 10 --iters 100 --repeat 5
@@ -134,8 +138,8 @@ After a change (meta or structural):
 ```bash
 python tools/profile_suite.py \
   --suite suites/ironfist/gemm_split_k_kernel_suite.json \
-  --module kernels/ironfist/gemm_split_k_kernel.py \
-  --baseline-module runs/gemm_split_k_kernel/baseline/baseline_module.py \
+  --module kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
+  --baseline-module runs/gemm_split_k_kernel_a4a9473a/baseline/baseline_module.py \
   --device cuda:0 \
   --tag struct_001 \
   --warmup 10 --iters 100 --repeat 5 \
@@ -175,11 +179,11 @@ Plain timing of one contract:
 ```bash
 python tools/profile_contract.py \
   --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
-  --module   kernels/ironfist/gemm_split_k_kernel.py \
+  --module   kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --entry-point run \
   --device cuda:0 \
   --warmup 10 --iters 100 --repeat 5 \
-  --out runs/gemm_split_k_kernel/large_baseline
+  --out runs/gemm_split_k_kernel_a4a9473a/large_baseline
 ```
 
 With Nsight Compute:
@@ -187,15 +191,18 @@ With Nsight Compute:
 ```bash
 python tools/profile_contract.py \
   --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
-  --module   kernels/ironfist/gemm_split_k_kernel.py \
+  --module   kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --entry-point run \
   --device cuda:0 \
   --warmup 10 --iters 100 --repeat 5 \
-  --baseline-module runs/gemm_split_k_kernel/baseline/baseline_module.py \
-  --out runs/gemm_split_k_kernel/ncu_large \
+  --baseline-module runs/gemm_split_k_kernel_a4a9473a/baseline/baseline_module.py \
+  --out runs/gemm_split_k_kernel_a4a9473a/ncu_large \
   --timing-mode cuda_graphs  # optional: events (default) or cuda_graphs \
+  --backend triton \
   --with-ncu \
-  --ncu-bin ncu
+  --ncu-bin ncu \
+  --ncu-call auto \
+  --ncu-args "--kernel-name gemm_split_k_kernel"
 ```
 
 Use this when:
@@ -205,7 +212,31 @@ Use this when:
 * or generating an Nsight report for one contract.
 * Correctness is always checked vs baseline before timing; if no `--baseline-module` is supplied, it defaults to the candidate module or an existing baseline snapshot.
 * Triton-only contracts without a Python wrapper are supported: entry_point defaults to `metadata.kernel_name`, meta args are pulled from `is_meta` fields, and launch uses the contract `io.launch.grid/num_warps/num_stages` to call `kernel[grid](...)`.
-* Nsight: the tool now relies on `--set full` without restricting sections; if you need additional counters, add `--metrics` via the script or a manual NCU call.
+* Nsight: the wrapper uses `ncu -f --set full ... --export <out>/ncu_report` and writes the exact command to `<out>/ncu_cmd.txt`.
+  * For custom Nsight flags (filters/metrics), pass `--ncu-args "..."` or run `ncu` directly (below).
+  * For `multi_kernel` contracts, the default (`--ncu-call auto`) profiles `benchmark_kernel` when it is used for timing.
+
+**Backend / language switching (Option A)**
+
+* Treat `multi_kernel` contracts as “shape-only” and put the real implementation behind `benchmark_kernel`.
+* Use `--backend <name>` to select an implementation (e.g. `triton`, `cuda`, `cutlass`). The tools pass this via:
+  * `contract_args["_backend"]` (for `benchmark_kernel`), and
+  * `KO_BACKEND` environment variable (for any code path).
+* If you implement the candidate backend only in the entrypoint (`run()`), use `--timing-target entrypoint` and `--ncu-call entrypoint` so the harness measures/profiles that path.
+
+**Direct Nsight Compute (recommended when you want “just ncu”)**
+
+```bash
+ncu -f --set full --target-processes all --import-source yes \
+  --export runs/gemm_split_k_kernel_a4a9473a/ncu_large/ncu_report \
+  python tools/run_contract_once.py \
+    --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
+    --module kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
+    --call benchmark_kernel \
+    --warmup 0 --iters 1 --repeat 1 \
+    --backend triton \
+    --device cuda:0
+```
 
 ---
 
@@ -225,14 +256,14 @@ Use this when:
 
 ```bash
 python tools/append_trace.py \
-  --kernel-name gemm_split_k_kernel \
-  --summary runs/gemm_split_k_kernel/struct_010/summary.json \
-  --baseline runs/gemm_split_k_kernel/baseline/summary.json \
+  --kernel-name gemm_split_k_kernel_a4a9473a \
+  --summary runs/gemm_split_k_kernel_a4a9473a/struct_010/summary.json \
+  --baseline runs/gemm_split_k_kernel_a4a9473a/baseline/summary.json \
   --tag struct_010 \
   --edit-kind structural \
   --description "Shape-aware split_k clamp + tiling tweaks; ~1.05x geomean" \
-  --contract runs/gemm_split_k_kernel_large_contract.json \
-  --ncu-summary runs/gemm_split_k_kernel/ncu_struct_010_large/ncu_summary.json
+  --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
+  --ncu-summary runs/gemm_split_k_kernel_a4a9473a/ncu_struct_010_large/ncu_summary.json
 ```
 
 Use this when you want a durable history of good attempts. You don’t
@@ -256,9 +287,9 @@ They are **not required** for every attempt.
 
 ```bash
 python tools/summarize_ncu.py \
-  --report runs/gemm_split_k_kernel/ncu_large/ncu_report.ncu-rep \
+  --report runs/gemm_split_k_kernel_a4a9473a/ncu_large/ncu_report.ncu-rep \
   --mode summary \
-  > runs/gemm_split_k_kernel/ncu_large/ncu_summary.json
+  > runs/gemm_split_k_kernel_a4a9473a/ncu_large/ncu_summary.json
 ```
 
 Use this to answer:
@@ -327,25 +358,25 @@ Snippet for a source span:
 
 ```bash
 python tools/ptx_source_summary.py \
-  --report runs/gemm_split_k_kernel/ncu_import_source_test3/ncu_report.ncu-rep \
+  --report runs/gemm_split_k_kernel_a4a9473a/ncu_import_source_test3/ncu_report.ncu-rep \
   --kernel gemm_split_k_kernel \
-  --source-file gemm_split_k_kernel.py \
+  --source-file kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --start-line 90 --end-line 130 \
   --include-sass \
   --include-metric \
   --extra-metric smsp__pcsamp_warps_issue_stalled_long_scoreboard \
-  > runs/gemm_split_k_kernel/ncu_import_source_test3/source_span.json
+  > runs/gemm_split_k_kernel_a4a9473a/ncu_import_source_test3/source_span.json
 ```
 
 Full mapping filtered to a file:
 
 ```bash
 python tools/ptx_source_summary.py \
-  --report runs/gemm_split_k_kernel/ncu_import_source_test3/ncu_report.ncu-rep \
+  --report runs/gemm_split_k_kernel_a4a9473a/ncu_import_source_test3/ncu_report.ncu-rep \
   --kernel gemm_split_k_kernel \
-  --source-file gemm_split_k_kernel.py \
+  --source-file kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --mode mapping \
-  > runs/gemm_split_k_kernel/ncu_import_source_test3/source_mapping.json
+  > runs/gemm_split_k_kernel_a4a9473a/ncu_import_source_test3/source_mapping.json
 ```
 
 > Tip: pass `--nvtx <range>` and `--kernel <name>` when profiling multiple actions in one report so the correlator picks the right kernel without fallback.
@@ -431,7 +462,7 @@ For a kernel family, e.g. `gemm_split_k_kernel`:
 
    ```bash
    python tools/init_kernels_and_suites.py \
-     --contracts-dir contracts \
+     --contracts-subdir ironfist \
      --kernels-dir kernels \
      --suites-dir suites
    ```
@@ -439,8 +470,8 @@ For a kernel family, e.g. `gemm_split_k_kernel`:
 2. **Read the suite and kernel**
 
    ```bash
-   cat suites/gemm_split_k_kernel_suite.json
-   sed -n '1,200p' kernels/gemm_split_k_kernel.py
+   cat suites/ironfist/gemm_split_k_kernel_suite.json
+   sed -n '1,200p' kernels/ironfist/gemm_split_k_kernel_a4a9473a.py
    ```
 
    Understand:
@@ -463,7 +494,7 @@ Get a suite-level baseline:
 ```bash
 python tools/profile_suite.py \
   --suite suites/ironfist/gemm_split_k_kernel_suite.json \
-  --module kernels/ironfist/gemm_split_k_kernel.py \
+  --module kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --device cuda:0 \
   --tag baseline \
   --warmup 10 --iters 100 --repeat 5
@@ -474,18 +505,21 @@ or a realistic config) and generate an Nsight baseline:
 
 ```bash
 python tools/profile_contract.py \
-  --contract contracts/gemm_split_k_kernel_large_contract.json \
-  --module   kernels/gemm_split_k_kernel.py \
+  --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
+  --module   kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --entry-point run \
   --device cuda:0 \
   --warmup 10 --iters 100 --repeat 5 \
-  --out runs/gemm_split_k_kernel/ncu_large \
-  --with-ncu --ncu-bin ncu
+  --out runs/gemm_split_k_kernel_a4a9473a/ncu_large \
+  --backend triton \
+  --with-ncu --ncu-bin ncu \
+  --ncu-call auto \
+  --ncu-args "--kernel-name gemm_split_k_kernel"
 
 python tools/summarize_ncu.py \
-  --report runs/gemm_split_k_kernel/ncu_large/ncu_report.ncu-rep \
+  --report runs/gemm_split_k_kernel_a4a9473a/ncu_large/ncu_report.ncu-rep \
   --mode summary \
-  > runs/gemm_split_k_kernel/ncu_large/ncu_summary.json
+  > runs/gemm_split_k_kernel_a4a9473a/ncu_large/ncu_summary.json
 ```
 
 Treat:
@@ -503,7 +537,7 @@ After each baseline or candidate run:
 1. **Read the suite summary**, e.g.:
 
    ```bash
-   cat runs/gemm_split_k_kernel/baseline/summary.json
+   cat runs/gemm_split_k_kernel_a4a9473a/baseline/summary.json
    ```
 
    Note which contracts dominate time and whether any are outliers.
@@ -590,7 +624,7 @@ With your new change in place, run a suite benchmark with a new tag:
 ```bash
 python tools/profile_suite.py \
   --suite suites/ironfist/gemm_split_k_kernel_suite.json \
-  --module kernels/ironfist/gemm_split_k_kernel.py \
+  --module kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --device cuda:0 \
   --tag struct_001 \
   --warmup 10 --iters 100 --repeat 5
@@ -612,17 +646,20 @@ If helpful, run Nsight again on the same representative contract:
 ```bash
 python tools/profile_contract.py \
   --contract contracts/ironfist/gemm_split_k_kernel_large_contract.json \
-  --module   kernels/ironfist/gemm_split_k_kernel.py \
+  --module   kernels/ironfist/gemm_split_k_kernel_a4a9473a.py \
   --entry-point run \
   --device cuda:0 \
   --warmup 10 --iters 100 --repeat 5 \
-  --out runs/gemm_split_k_kernel/ncu_struct_001_large \
-  --with-ncu --ncu-bin ncu
+  --out runs/gemm_split_k_kernel_a4a9473a/ncu_struct_001_large \
+  --backend triton \
+  --with-ncu --ncu-bin ncu \
+  --ncu-call auto \
+  --ncu-args "--kernel-name gemm_split_k_kernel"
 
 python tools/summarize_ncu.py \
-  --report runs/gemm_split_k_kernel/ncu_struct_001_large/ncu_report.ncu-rep \
+  --report runs/gemm_split_k_kernel_a4a9473a/ncu_struct_001_large/ncu_report.ncu-rep \
   --mode summary \
-  > runs/gemm_split_k_kernel/ncu_struct_001_large/ncu_summary.json
+  > runs/gemm_split_k_kernel_a4a9473a/ncu_struct_001_large/ncu_summary.json
 ```
 
 Then go back to **Step 2** with the new results:

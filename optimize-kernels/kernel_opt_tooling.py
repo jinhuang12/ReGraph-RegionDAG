@@ -40,15 +40,20 @@ Dependencies:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
-import os
+import math
 import re
 import sys
-from dataclasses import dataclass
+import subprocess
+import tempfile
+import shutil
+import os
 from pathlib import Path
+from enum import Enum
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Logging setup (simple default)
@@ -65,13 +70,9 @@ if not logger.handlers:
 # Region-DAG wrappers (using your existing ptx_dag_tool_v2)
 # ---------------------------------------------------------------------------
 
-try:
-    from ptx_dag_tool_v2 import build_all, Region, Stage  # type: ignore
-except Exception as e:
-    logger.warning("Could not import ptx_dag_tool_v2: %s", e)
-    build_all = None  # type: ignore
-    Region = None     # type: ignore
-    Stage = None      # type: ignore
+from ptx_dag_tool_v2 import build_all, Region, Stage  # type: ignore
+from ptx_source_correlator import PtxSourceCorrelator  # type: ignore
+from shared.model import DeviceProfile
 
 
 class RegionDagContext:
@@ -340,6 +341,68 @@ def _safe_div(n: Optional[float], d: Optional[float]) -> Optional[float]:
 # -------------------------------
 # Canonical → NCU metric mappings
 # -------------------------------
+FLOP_WEIGHTS: Dict[str, float] = {
+    # Floating-point scalar ops
+    "smsp__sass_thread_inst_executed_op_ffma_pred_on.sum": 2.0,
+    "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum": 1.0,
+    "smsp__sass_thread_inst_executed_op_fmul_pred_on.sum": 1.0,
+    "smsp__sass_thread_inst_executed_op_fmad_pred_on.sum": 2.0,
+    # Tensor core ops (approximate MMA FLOPs; adjust per arch as needed)
+    "smsp__sass_thread_inst_executed_op_hmma_pred_on.sum": 256.0,
+    "smsp__sass_thread_inst_executed_op_dmma_pred_on.sum": 512.0,
+}
+
+def compute_arithmetic_intensity(raw_metrics: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Compute arithmetic intensity (FLOPs / DRAM byte) from raw Nsight metrics.
+    Uses dram__bytes_read.sum + dram__bytes_write.sum and weighted FLOP counters.
+    """
+    bytes_read = float(raw_metrics.get("dram__bytes_read.sum", 0.0) or 0.0)
+    bytes_write = float(raw_metrics.get("dram__bytes_write.sum", 0.0) or 0.0)
+    dram_bytes = bytes_read + bytes_write
+
+    flops = 0.0
+    for name, weight in FLOP_WEIGHTS.items():
+        try:
+            flops += float(raw_metrics.get(name, 0.0) or 0.0) * weight
+        except Exception:
+            continue
+
+    if dram_bytes <= 0.0:
+        ai = math.inf if flops > 0 else 0.0
+    else:
+        ai = flops / dram_bytes
+
+    return {
+        "arith_intensity_flop_per_byte": ai,
+        "arith_intensity_flops": flops,
+        "arith_intensity_dram_bytes": dram_bytes,
+    }
+
+def compute_roofline_bound(ai_flop_per_byte: float, device_profile: Optional[DeviceProfile]) -> Dict[str, Any]:
+    """
+    Classify bound type using a simple roofline balance point if device peak FLOPs
+    and memory bandwidth are known.
+    """
+    if not device_profile:
+        return {"roofline_bound": "unknown"}
+
+    peak_flops_tflops = device_profile.peak_flops_tflops
+    mem_bw_gbps = device_profile.mem_bandwidth_gbps or device_profile.hbm_bw_gbps
+
+    if peak_flops_tflops is None or mem_bw_gbps is None or mem_bw_gbps <= 0:
+        return {"roofline_bound": "unknown"}
+
+    I_crit = (peak_flops_tflops * 1e12) / (mem_bw_gbps * 1e9)  # FLOP/byte
+    bound = "unknown"
+    if math.isfinite(ai_flop_per_byte):
+        if ai_flop_per_byte < 0.5 * I_crit:
+            bound = "memory_bound"
+        elif ai_flop_per_byte > 2.0 * I_crit:
+            bound = "compute_bound"
+        else:
+            bound = "balanced"
+    return {"roofline_bound": bound, "roofline_I_crit": I_crit}
 
 CANONICAL_METRIC_SECTIONS: Dict[str, Dict[str, str]] = {
     # High-level Speed-of-Light / throughput
@@ -483,7 +546,7 @@ class NcuMetricsContext:
       - search_names(): substring search over metric names/descriptions.
     """
 
-    def __init__(self, report_path: str, range_idx: int = 0, action_idx: int = 0):
+    def __init__(self, report_path: str, range_idx: int = 0, action_idx: int = 0, device_profile: Optional[DeviceProfile] = None):
         if not NCU_REPORT_AVAILABLE:
             raise RuntimeError("ncu_report is not available; Nsight Compute must be installed.")
 
@@ -492,9 +555,11 @@ class NcuMetricsContext:
         self.range = self.report.range_by_idx(range_idx)
         self.action = self.range.action_by_idx(action_idx)
         self.kernel_name = self.action.name()
+        self.device_profile = device_profile
 
         # Cache all metrics.
         self._metrics: Dict[str, MetricInfo] = self._collect_metrics()
+        self.raw_metrics: Dict[str, Any] = {name: mi.value for name, mi in self._metrics.items()}
 
     def _collect_metrics(self) -> Dict[str, MetricInfo]:
         metrics: Dict[str, MetricInfo] = {}
@@ -535,7 +600,12 @@ class NcuMetricsContext:
               "device_name": str | None,
               "speed_of_light": {...},
               "scheduling": {...},
-              "memory": {...}
+              "memory": {...},
+              "arith_intensity_flop_per_byte": float,
+              "arith_intensity_flops": float,
+              "arith_intensity_dram_bytes": float,
+              "roofline_bound": str,
+              "roofline_I_crit": float | None
             }
         """
         # Helper: read by canonical name
@@ -587,6 +657,20 @@ class NcuMetricsContext:
                 "l2_throughput_pct": get_canon("l2_throughput_pct"),
             },
         }
+
+        # Arithmetic intensity + roofline
+        try:
+            ai_info = compute_arithmetic_intensity(self.raw_metrics)
+            summary.update(ai_info)
+            summary.update(compute_roofline_bound(ai_info["arith_intensity_flop_per_byte"], self.device_profile))
+        except Exception:
+            summary.update({
+                "arith_intensity_flop_per_byte": None,
+                "arith_intensity_flops": None,
+                "arith_intensity_dram_bytes": None,
+                "roofline_bound": "unknown",
+                "roofline_I_crit": None,
+            })
         return summary
 
     # ------------------------- Get values (mode = "get_values") -------------------
@@ -658,431 +742,6 @@ class NcuMetricsContext:
                 if len(matches) >= max_results:
                     break
         return {"query": query, "matches": matches}
-
-
-# ---------------------------------------------------------------------------
-# PTX↔source correlator + snippet API
-# ---------------------------------------------------------------------------
-
-class PtxSourceCorrelator:
-    """
-    Correlate PTX (and optionally SASS) to source lines using a .ncu-rep file.
-
-    The core API we care about for tool usage is:
-        get_ptx_snippet_for_source_span(...)
-    """
-
-    PREFERRED_BASE_METRICS: List[str] = [
-        "inst_executed",
-        "thread_inst_executed",
-        "thread_inst_executed_true",
-        "derived__avg_thread_executed",
-        "smsp__pcsamp_sample_count",
-    ]
-
-    EXCLUDED_BASE_PREFIXES: Tuple[str, ...] = (
-        "launch__",
-        "device__",
-        "numa__",
-        "nvlink__",
-        "profiler__",
-        "pmsampling:dramc__",
-    )
-
-    def __init__(self, report_path: Path):
-        self.report_path = Path(report_path)
-        self._report = None
-
-        self.available = bool(
-            NCU_REPORT_AVAILABLE and self.report_path.exists()
-        )
-
-        if not NCU_REPORT_AVAILABLE:
-            logger.debug("ncu_report API not available in PtxSourceCorrelator.")
-        elif not self.report_path.exists():
-            logger.warning("NCU report file not found for PtxSourceCorrelator: %s", self.report_path)
-
-    # --------------------- Public: snippet for LLM tool -------------------------
-
-    def get_ptx_snippet_for_source_span(
-        self,
-        nvtx_range: Optional[str],
-        kernel_name: Optional[str],
-        source_file: str,
-        start_line: int,
-        end_line: int,
-        max_insts: int = 64,
-        include_sass: bool = False,
-        include_metric_value: bool = False,
-        extra_metric_names: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """
-        High-level, LLM-friendly API that returns a correlated PTX/SASS snippet.
-        """
-        if not self.available:
-            return {
-                "source_file": source_file,
-                "start_line": start_line,
-                "end_line": end_line,
-                "total_instructions": 0,
-                "truncated": False,
-                "lines": [],
-                "error": "PtxSourceCorrelator not available (no report or ncu_report).",
-            }
-
-        mapping = self.correlate_ptx_to_source(
-            nvtx_range=nvtx_range,
-            kernel_name=kernel_name,
-            base_metric_name=None,
-            include_sass=include_sass,
-            include_metric_value=include_metric_value,
-            source_file_filter=source_file,
-            extra_metric_names=extra_metric_names,
-        )
-
-        if source_file not in mapping:
-            return {
-                "source_file": source_file,
-                "start_line": start_line,
-                "end_line": end_line,
-                "total_instructions": 0,
-                "truncated": False,
-                "lines": [],
-            }
-
-        file_map = mapping[source_file]
-
-        # Load source text.
-        try:
-            with open(source_file, "r", encoding="utf-8", errors="replace") as f:
-                src_lines = f.read().splitlines()
-        except Exception:
-            src_lines = []
-
-        def get_src_line(ln: int) -> str:
-            if 1 <= ln <= len(src_lines):
-                return src_lines[ln - 1]
-            return ""
-
-        lines_out: List[Dict[str, Any]] = []
-        total_insts = 0
-        remaining = max_insts
-        truncated = False
-
-        for line_no in sorted(file_map.keys()):
-            if line_no < start_line or line_no > end_line:
-                continue
-            if remaining <= 0:
-                truncated = True
-                break
-
-            entries = file_map[line_no]
-            entries_sorted = sorted(entries, key=lambda e: e.get("pc", 0))
-
-            line_entries_out: List[Dict[str, Any]] = []
-            for entry in entries_sorted:
-                if remaining <= 0:
-                    truncated = True
-                    break
-
-                pc = entry.get("pc")
-                ptx = (entry.get("ptx") or "").rstrip()
-                sass = (entry.get("sass") or "").rstrip() if include_sass else None
-                metrics = entry.get("metrics") or {} if include_metric_value else {}
-
-                line_entries_out.append(
-                    {
-                        "pc": f"0x{pc:x}" if isinstance(pc, int) else None,
-                        "ptx": ptx,
-                        "sass": sass,
-                        "metrics": metrics,
-                    }
-                )
-                total_insts += 1
-                remaining -= 1
-
-            if line_entries_out:
-                lines_out.append(
-                    {
-                        "line": line_no,
-                        "source": get_src_line(line_no),
-                        "entries": line_entries_out,
-                    }
-                )
-
-        return {
-            "source_file": source_file,
-            "start_line": start_line,
-            "end_line": end_line,
-            "total_instructions": total_insts,
-            "truncated": truncated,
-            "lines": lines_out,
-        }
-
-    # --------------------- Original mapping API (streamlined) -------------------
-
-    def correlate_ptx_to_source(
-        self,
-        nvtx_range: Optional[str] = None,
-        kernel_name: Optional[str] = None,
-        base_metric_name: Optional[str] = None,
-        include_sass: bool = False,
-        include_metric_value: bool = False,
-        source_file_filter: Optional[Any] = None,
-        extra_metric_names: Optional[List[str]] = None,
-    ) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
-        """
-        Core correlation logic (streamlined from your script).
-
-        Returns nested mapping:
-            {
-              "source_file_path": {
-                  line_number: [
-                      {"pc": int, "ptx": str, "sass": str?, "metrics": {...}?},
-                      ...
-                  ],
-                  ...
-              },
-              ...
-            }
-        """
-        if not self.available:
-            return {}
-
-        report = self._load_report()
-        if report is None:
-            return {}
-
-        action = self._select_action(report, nvtx_range=nvtx_range, kernel_name=kernel_name)
-        if action is None:
-            logger.warning("No matching kernel action found in report.")
-            return {}
-
-        # Pick base metric.
-        base_name, base_metric, base_cid = self._pick_base_metric(action, explicit_base=base_metric_name)
-        if base_metric is None or base_cid is None:
-            logger.warning("Could not find a suitable base metric with correlation IDs.")
-            return {}
-
-        logger.info(
-            "Using base metric '%s' with %d correlation IDs for PTX/source mapping.",
-            base_name,
-            base_cid.num_instances(),
-        )
-
-        # Build address→value maps for extra metrics.
-        extra_metric_names = extra_metric_names or []
-        extra_metric_maps = self._build_extra_metric_maps(action, extra_metric_names)
-
-        file_pred = self._make_file_predicate(source_file_filter)
-        result: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
-
-        num_ids = base_cid.num_instances()
-        for idx in range(num_ids):
-            try:
-                pc = base_cid.as_uint64(idx)
-            except Exception as e:
-                logger.debug("Failed to read correlation ID at %d: %s", idx, e)
-                continue
-            if not pc:
-                continue
-
-            src_info = action.source_info(pc)
-            if src_info is None:
-                continue
-
-            file_name = src_info.file_name()
-            line_no = src_info.line()
-            if not file_name or not isinstance(line_no, int):
-                continue
-
-            if file_pred is not None and not file_pred(file_name):
-                continue
-
-            ptx = action.ptx_by_pc(pc) or ""
-            if not ptx.strip():
-                continue
-
-            entry: Dict[str, Any] = {"pc": pc, "ptx": ptx}
-
-            if include_sass:
-                sass = action.sass_by_pc(pc) or ""
-                if sass.strip():
-                    entry["sass"] = sass
-
-            if include_metric_value:
-                metrics_for_pc: Dict[str, Any] = {}
-                try:
-                    metrics_for_pc[base_name] = base_metric.value(idx)
-                except Exception:
-                    pass
-
-                for mname, addr_map in extra_metric_maps.items():
-                    if pc in addr_map:
-                        metrics_for_pc[mname] = addr_map[pc]
-
-                if metrics_for_pc:
-                    entry["metrics"] = metrics_for_pc
-
-            file_bucket = result.setdefault(file_name, {})
-            line_bucket = file_bucket.setdefault(line_no, [])
-            line_bucket.append(entry)
-
-        return result
-
-    def _load_report(self):
-        if self._report is None:
-            try:
-                self._report = ncu_report.load_report(str(self.report_path))  # type: ignore
-            except Exception as e:
-                logger.error("Failed to load report %s: %s", self.report_path, e)
-                self._report = None
-        return self._report
-
-    def _select_action(self, report, nvtx_range: Optional[str], kernel_name: Optional[str]):
-        ctx = report
-        num_ranges = getattr(ctx, "num_ranges", lambda: 0)()
-        if num_ranges == 0:
-            return None
-
-        chosen_range = None
-        for ridx in range(num_ranges):
-            rng = ctx.range_by_idx(ridx)
-            try:
-                rname = rng.name()
-            except Exception:
-                rname = ""
-            if nvtx_range is None or (rname and nvtx_range in rname):
-                chosen_range = rng
-                break
-
-        if chosen_range is None:
-            chosen_range = ctx.range_by_idx(0)
-
-        num_actions = getattr(chosen_range, "num_actions", lambda: 0)()
-        if num_actions == 0:
-            return None
-
-        if kernel_name is None:
-            return chosen_range.action_by_idx(0)
-
-        for aidx in range(num_actions):
-            action = chosen_range.action_by_idx(aidx)
-            try:
-                aname = action.name()
-            except Exception:
-                aname = ""
-            if kernel_name in aname:
-                return action
-
-        return chosen_range.action_by_idx(0)
-
-    def _pick_base_metric(self, action, explicit_base: Optional[str] = None):
-        metric_names = list(action.metric_names())
-        metrics: Dict[str, Any] = {}
-        for name in metric_names:
-            try:
-                m = action.metric_by_name(name)
-            except Exception:
-                m = None
-            if m is not None:
-                metrics[name] = m
-
-        def usable(name: str, m) -> Optional[Any]:
-            try:
-                if not m.has_correlation_ids():
-                    return None
-                cid = m.correlation_ids()
-                if cid is None or cid.num_instances() == 0:
-                    return None
-                return cid
-            except Exception:
-                return None
-
-        if explicit_base is not None:
-            m = metrics.get(explicit_base)
-            if m is not None:
-                cid = usable(explicit_base, m)
-                if cid is not None:
-                    return explicit_base, m, cid
-                else:
-                    logger.warning("Requested base metric '%s' has no usable correlation IDs.", explicit_base)
-
-        for pname in self.PREFERRED_BASE_METRICS:
-            m = metrics.get(pname)
-            if m is None:
-                continue
-            cid = usable(pname, m)
-            if cid is not None:
-                return pname, m, cid
-
-        best_name = None
-        best_metric = None
-        best_cid = None
-        best_count = -1
-        for name, m in metrics.items():
-            if name.startswith(self.EXCLUDED_BASE_PREFIXES):
-                continue
-            cid = usable(name, m)
-            if cid is None:
-                continue
-            count = cid.num_instances()
-            if count > best_count:
-                best_name = name
-                best_metric = m
-                best_cid = cid
-                best_count = count
-
-        return best_name, best_metric, best_cid
-
-    def _build_extra_metric_maps(self, action, extra_metric_names: List[str]) -> Dict[str, Dict[int, Any]]:
-        maps: Dict[str, Dict[int, Any]] = {}
-
-        for mname in extra_metric_names:
-            try:
-                m = action.metric_by_name(mname)
-            except Exception:
-                m = None
-
-            if not m:
-                logger.warning("Extra metric '%s' not found on this action.", mname)
-                continue
-
-            try:
-                if not m.has_correlation_ids():
-                    logger.warning("Extra metric '%s' has no correlation IDs; skipping.", mname)
-                    continue
-                cid = m.correlation_ids()
-                if cid is None or cid.num_instances() == 0:
-                    logger.warning("Extra metric '%s' has 0 correlation IDs; skipping.", mname)
-                    continue
-
-                addr_to_val: Dict[int, Any] = {}
-                n = cid.num_instances()
-                for idx in range(n):
-                    addr = cid.as_uint64(idx)
-                    val = m.value(idx)
-                    addr_to_val[addr] = val
-                maps[mname] = addr_to_val
-
-            except Exception as e:
-                logger.warning("Failed to process extra metric '%s': %s", mname, e)
-
-        return maps
-
-    def _make_file_predicate(self, filt: Optional[Any]):
-        if filt is None:
-            return None
-        if isinstance(filt, str):
-            needle = filt
-
-            def pred(path: str) -> bool:
-                return needle in path
-
-            return pred
-        if callable(filt):
-            return filt
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +901,14 @@ PTX_SOURCE_TOOL_SCHEMA = {
     },
 }
 
-TOOLS = [REGION_DAG_TOOL_SCHEMA, NCU_METRICS_TOOL_SCHEMA, PTX_SOURCE_TOOL_SCHEMA]
+APPLY_PATCH_TOOL = {"type": "apply_patch"}
+
+TOOLS = [
+    REGION_DAG_TOOL_SCHEMA,
+    NCU_METRICS_TOOL_SCHEMA,
+    PTX_SOURCE_TOOL_SCHEMA,
+    APPLY_PATCH_TOOL,
+]
 
 # ------------------------ Tool registry + dispatcher -------------------------
 
@@ -1370,63 +1036,77 @@ DEFAULT_TOOL_REGISTRY.register("get_ptx_by_source", get_ptx_by_source_tool)
 # ----------------------- OpenAI Responses API integration --------------------
 
 LLM_SYSTEM_PROMPT = """
-You are an expert GPU performance engineer optimizing a Triton/CUDA kernel.
+You are an expert GPU performance engineer optimizing Triton/CUDA kernels in a real git repository.
 
-== Objects you will receive ==
-1) ncu_signals: Nsight Compute metrics for the same kernel:
-   • examples: sm__throughput.avg.pct_of_peak_sustained_elapsed,
-               sm__warps_active.avg.pct_of_peak_sustained_active,
-               dram__bytes.avg.per_second,
-               smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,
-               smsp__warp_issue_stalled_barrier_per_warp_active.pct.
-   • These are ground truth for diagnosing stalls vs overlap.
+== Context you receive ==
+1) ncu_signals: Nsight Compute metrics for THIS kernel.
+   • These are the ground truth for bottlenecks: SoL throughput, stalls, occupancy, etc.
 
-2) region_summary: a compact summary of a Region-DAG built from PTX:
-   • Each node (region) is a contiguous run of PTX with the same phase:
-     {mem_param_load | mem_global_load | mem_shared_load | mem_async_copy | async_wait |
-      barrier | compute | global_store | shared_store | atomic | control | addr_arith | other}
-   • Edges:
-     - flow: linear program order between regions (may overlap at runtime)
-     - barrier: CTA barrier (e.g., bar.sync) → hard stage cut (no overlap across it)
-     - async_dep: cp.async group(s) that feed the first shared-load consumer after a wait
-   • Per-region metrics: bytes_global_r/w, bytes_shared_r/w, flops.
-   • Stages: contiguous region groups split at barrier/async_wait; each stage has FLOPs and bytes.
+2) region_summary: a compact summary of a Region-DAG built from PTX.
+   • Regions are contiguous PTX segments with a phase label
+     (mem_param_load, mem_global_load, mem_shared_load, mem_async_copy, async_wait,
+      barrier, compute, global_store, shared_store, atomic, control, addr_arith, other).
+   • Stages group regions between hard synchronization points (barriers / async waits).
+   • Each region and stage has a static work profile: FLOPs, global/shared bytes,
+     instruction counts, and atomics.
 
-3) source_code: original Triton/CUDA kernel (or a diffable excerpt). Optionally: PTX/source map.
+3) source_code: the CURRENT version of the kernel from the working copy on disk,
+   plus an example host invocation if available.
 
-== Your Core Workflow ==
-• Analyze the ncu_signals to understand the behavior of the kernel (ground truth).
-• Use the region_summary to find the *location* of the bottleneck (SoL, stalls, occupancy, pipe utilizations).
-• Form hypothesis and drill down
-  - "Hypothesis: The kernel is memory-bound (from NCU), and Stage 1 seems
-      to be the main loading stage (from DAG). I will inspect its source code."
-  - Call 'region_dag_inspect(mode="stage_detail", stage_id=1)' for details.
-  - Call 'get_ptx_by_source(...)' for the source-correlated PTX.
-  - Call 'ncu_metrics_inspect(mode="get_values", ...)' for more stall data.
-• Once you have a confirmed hypothesis, propose optimizations in the STRICT JSON format below.  
+== Tools available ==
+You have these tools via the Responses API:
 
-== What “optimize” means ==
-• Propose concrete code or launch changes that reduce kernel latency:
-  - more overlap (async pipelines, double buffering),
-  - fewer stalls (barrier stalls, long scoreboard, uncoalesced accesses),
-  - higher effective DRAM / L2 BW,
-  - better tensor-core or ALU utilization,
-  - less epilogue traffic and redundant moves.
-• Prefer surgical changes that target the dominant stage(s).
+1) region_dag_inspect(mode=..., ...)
+   • Inspect pipeline stages and regions, and their static work profiles.
 
-== What to output ==
-STRICT JSON only:
+2) ncu_metrics_inspect(mode=..., ...)
+   • Inspect Nsight Compute metrics (summary, specific metrics, or metric-name search).
+
+3) get_ptx_by_source(source_file, start_line, end_line, ...)
+   • Inspect PTX/SASS around specific source lines.
+
+4) apply_patch  (BUILT-IN)
+   • This is your ONLY way to create, update, move, or delete files in the repository.
+   • When you need to change code, emit apply_patch_call operations with small, coherent diffs
+     targeting the real source files in the working tree.
+   • Never assume code has changed unless your apply_patch_call_output status is "completed".
+
+== Workflow ==
+1) Read ncu_signals, region_summary, and source_code.
+2) Form a hypothesis about the bottleneck:
+   • memory-bound vs compute-bound vs latency/scoreboard vs occupancy vs launch-config issues.
+3) Use tools as needed:
+   • region_dag_inspect to localize hot stages/regions.
+   • ncu_metrics_inspect for detailed stall/utilization metrics.
+   • get_ptx_by_source to inspect PTX/SASS around hot loops or suspicious address arithmetic.
+4) Once you have a clear hypothesis, use apply_patch to modify the kernel (and, if needed,
+   closely related launch/config code) in the working tree. Keep each patch surgical:
+   • Prefer retuning block sizes, tiling, async pipelines, prefetching, or minor layout changes
+     over sweeping rewrites.
+   • Focus patches on the diagnosed hot path.
+5) After all tool calls (including all apply_patch operations) are finished, respond with STRICT JSON
+   describing the best candidate(s) you actually implemented via apply_patch:
+
 {
   "candidates": [{
-    "think": "short reasoning about why this helps (concise).",
-    "method": "the optimization method (e.g., 'deepen async pipeline to 4 groups')",
-    "detail": "precise, minimal steps to apply in this codebase (Triton/CUDA params, memory layout, etc.).",
-    "code": "a unified diff or a full snippet that compiles (whichever is smaller)."
+    "think": "Short reasoning about what you changed and why it should help (concise).",
+    "method": "Short name for the optimization method (e.g., 'retune_block_sizes', 'deepen_async_pipeline').",
+    "detail": "Precise description of the code changes you made via apply_patch: which files, which kernel
+               parameters or loops you edited, and how that affects performance.",
+    "code": "A SHORT illustrative code excerpt (not a diff) showing the key changed loop or kernel,
+             consistent with the edits you applied."
   }]
 }
 
+If you decide you cannot safely improve the kernel, return:
+{
+  "candidates": []
+}
+
 == Constraints ==
-• Output only valid JSON. No markdown, no prose outside JSON fields.
+• Do NOT print diffs in the JSON. Real edits must be done via apply_patch; the JSON is a human-readable summary only.
+• Do NOT rely on the JSON alone to change code; only files modified via apply_patch are real.
+• Output ONLY valid JSON as described (no markdown, no backticks, no extra commentary).
 """
 
 def _collect_text_outputs(resp) -> str:
@@ -1458,50 +1138,74 @@ def _maybe_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def extract_tool_calls(resp) -> List[Dict[str, Any]]:
+def extract_function_and_patch_calls(resp) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Extract tool calls from a Responses API response.
+    Extract function-tool calls (region_dag_inspect / ncu_metrics_inspect / get_ptx_by_source)
+    and built-in apply_patch calls from a Responses API response.
 
-    Returns a list of: {"name": <str>, "arguments": <dict>, "call_id": <optional str>}
+    Returns:
+        (function_calls, patch_calls)
+
+        function_calls: [{ "name": str, "arguments": dict, "call_id": str }]
+        patch_calls:    [{ "operation": dict, "call_id": str }]
     """
-    calls: List[Dict[str, Any]] = []
+    fn_calls: List[Dict[str, Any]] = []
+    patch_calls: List[Dict[str, Any]] = []
+
+    def _as_dict(obj: Any) -> Any:
+        try:
+            return obj.model_dump()  # type: ignore
+        except Exception:
+            try:
+                return obj.to_dict()  # type: ignore
+            except Exception:
+                return obj
 
     for item in getattr(resp, "output", []) or []:
         t = getattr(item, "type", None)
-        if t in ("tool_call", "function_call"):
-            tool_obj = getattr(item, "tool_call", None) or getattr(item, "tool", None) \
-                       or getattr(item, "function_call", None) or getattr(item, "function", None)
-            if tool_obj:
-                name = getattr(tool_obj, "name", None)
-                args = getattr(tool_obj, "arguments", None)
-                call_id = getattr(tool_obj, "id", None) or getattr(item, "id", None)
+
+        if t == "function_call":
+            name = getattr(item, "name", None)
+            args = getattr(item, "arguments", None)
+            call_id = getattr(item, "id", None) or getattr(item, "call_id", None)
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+            if name:
+                fn_calls.append({"name": name, "arguments": args or {}, "call_id": call_id})
+            continue
+
+        if t == "apply_patch_call":
+            op = _as_dict(getattr(item, "operation", None))
+            call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+            if op is not None and call_id is not None:
+                patch_calls.append({"operation": op, "call_id": call_id})
+            continue
+
+        for c in getattr(item, "content", []) or []:
+            ct = getattr(c, "type", None)
+            if ct == "function_call":
+                name = getattr(c, "name", None)
+                args = getattr(c, "arguments", None)
+                call_id = getattr(c, "id", None) or getattr(c, "call_id", None)
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
                     except Exception:
                         pass
                 if name:
-                    calls.append({"name": name, "arguments": args or {}, "call_id": call_id})
-            continue
+                    fn_calls.append({"name": name, "arguments": args or {}, "call_id": call_id})
+                continue
 
-        for c in getattr(item, "content", []) or []:
-            ct = getattr(c, "type", None)
-            if ct in ("tool_call", "function_call"):
-                tool_obj = getattr(c, "tool_call", None) or getattr(c, "tool", None) \
-                           or getattr(c, "function_call", None) or getattr(c, "function", None)
-                if tool_obj:
-                    name = getattr(tool_obj, "name", None)
-                    args = getattr(tool_obj, "arguments", None)
-                    call_id = getattr(tool_obj, "id", None) or getattr(c, "id", None)
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            pass
-                    if name:
-                        calls.append({"name": name, "arguments": args or {}, "call_id": call_id})
+            if ct == "apply_patch_call":
+                op = _as_dict(getattr(c, "operation", None))
+                call_id = getattr(c, "call_id", None) or getattr(c, "id", None)
+                if op is not None and call_id is not None:
+                    patch_calls.append({"operation": op, "call_id": call_id})
 
-    return calls
+    return fn_calls, patch_calls
 
 
 class LLMCandidateGenerator:
@@ -1517,8 +1221,12 @@ class LLMCandidateGenerator:
         self.api_base = api_base
         self.client = None
         self.prev_id_by_kernel: Dict[str, str] = {}
-        self.tools = TOOLS
+        base_tools = TOOLS.copy()
+        self._supports_apply_patch = model.startswith("gpt-5.1")
+        self.tools = base_tools
         self.tool_registry = tool_registry or DEFAULT_TOOL_REGISTRY
+        # Assumes kernel_opt_tooling.py lives at repo root. Update if moved.
+        self.repo_root = Path(__file__).resolve().parent
 
     def _lazy_client(self):
         if self.client is None:
@@ -1528,7 +1236,7 @@ class LLMCandidateGenerator:
                 raise RuntimeError("OpenAI SDK not installed. `pip install openai`") from e
             self.client = OpenAI(base_url=self.api_base) if self.api_base else OpenAI()
 
-    def _mk_messages(self, kernel: Any, region_summary: Optional[Dict[str, Any]] = None, ncu_summary: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _mk_messages(self, kernel: Any, region_summary: Optional[Dict[str, Any]] = None, ncu_summary: Optional[Dict[str, Any]] = None, workdir_path: Optional[str] = None, source_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Build the initial "input" messages for the Responses API.
 
@@ -1544,49 +1252,151 @@ class LLMCandidateGenerator:
             ],
         }
 
+        content_blocks: List[Dict[str, Any]] = [
+            {"type": "input_text", "text": "KERNEL NAME:\n" + str(getattr(kernel, "name", "unknown_kernel"))},
+            {"type": "input_text", "text": "KERNEL SOURCE:\n" + (getattr(kernel, "source_code", "") or "")},
+            {"type": "input_text", "text": "INVOCATION_EXAMPLE:\n" + (getattr(kernel, "invocation_example", "") or "")},
+            {"type": "input_text", "text": "NCU SUMMARY (GROUND TRUTH):\n" + json.dumps(ncu_summary or {}, indent=2)},
+            {"type": "input_text", "text": "REGION SUMMARY (STATIC STRUCTURE & WORK PROFILE):\n" + json.dumps(region_summary or {}, indent=2)},
+            {"type": "input_text", "text": "WORKDIR (PATCH ROOT):\n" + str(workdir_path or self.repo_root)},
+            {"type": "input_text", "text": "Output STRICT JSON only per spec. No markdown."},
+        ]
+        if source_path:
+            content_blocks.insert(
+                2,
+                {"type": "input_text", "text": "KERNEL SOURCE PATH:\n" + str(source_path)},
+            )
+
         user_payload = {
             "role": "user",
-            "content": [
-                {"type": "input_text", "text": "KERNEL NAME:\n" + str(getattr(kernel, "name", "unknown_kernel"))},
-                {"type": "input_text", "text": "KERNEL SOURCE:\n" + (getattr(kernel, "source_code", "") or "")},
-                {"type": "input_text", "text": "INVOCATION_EXAMPLE:\n" + (getattr(kernel, "invocation_example", "") or "")},
-                {"type": "input_text", "text": "NCU SUMMARY (GROUND TRUTH):\n" + json.dumps(ncu_summary or {}, indent=2)},
-                {"type": "input_text", "text": "REGION SUMMARY (STATIC STRUCTURE & WORK PROFILE):\n" + json.dumps(region_summary or {}, indent=2)},
-                {"type": "input_text", "text": "Output STRICT JSON only per spec. No markdown."},
-            ],
+            "content": content_blocks,
         }
 
         return [sys_block, user_payload]
 
-    def _send(self, *, input_payload: List[Dict[str, Any]], previous_response_id: Optional[str] = None):
+    def _send(self, *, input_payload: Optional[List[Dict[str, Any]]] = None, previous_response_id: Optional[str] = None, tool_outputs: Optional[List[Dict[str, Any]]] = None):
         """
-        Thin wrapper around client.responses.create.
+        Thin wrapper around client.responses.create, supporting tool_outputs.
         """
-        kwargs: Dict[str, Any] = dict(model=self.model, input=input_payload, tools=self.tools)
+        kwargs: Dict[str, Any] = dict(model=self.model, tools=self.tools, input=(input_payload or []))
         if previous_response_id:
             kwargs["previous_response_id"] = previous_response_id
+        if tool_outputs:
+            kwargs["tool_outputs"] = tool_outputs
         return self.client.responses.create(**kwargs)
 
     def _send_tool_result(self, *, prev_id: str, name: str, call_id: Optional[str], result_obj: Dict[str, Any]):
         """
-        Send tool results back to the model with a 'tool' role message.
+        Send function-tool results back as a `function_call_output` event.
         """
-        tool_content = [
-            {
-                "type": "tool_result",
-                "tool_name": name,
-                **({"tool_call_id": call_id} if call_id else {}),
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": json.dumps(result_obj),
-                    }
-                ],
-            }
-        ]
-        tool_msg = {"role": "tool", "content": tool_content}
-        return self._send(input_payload=[tool_msg], previous_response_id=prev_id)
-    
+        if not call_id:
+            call_id = f"{name}_no_id"
+
+        event = {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(result_obj),
+        }
+        return self._send(input_payload=[event], previous_response_id=prev_id)
+
+    def _send_apply_patch_result(self, *, prev_id: str, call_id: str, status: str, log_output: str):
+        """
+        Send apply_patch execution result back as an `apply_patch_call_output` event.
+        """
+        event = {
+            "type": "apply_patch_call_output",
+            "call_id": call_id,
+            "status": status,
+            "output": log_output,
+        }
+        return self._send(input_payload=[event], previous_response_id=prev_id)
+
+    def _run_apply_patch_operation(self, workdir_path: str, operation: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Apply a single apply_patch operation to the working tree.
+
+        operation: { "type": "update_file"|"create_file"|"delete_file", "diff": "...", "path": "..." }
+        Returns (success, log_output).
+        """
+        op = operation or {}
+        diff_raw = op.get("diff", "")
+        repo = Path(workdir_path) if workdir_path else self.repo_root
+        if not diff_raw:
+            return False, "No diff provided"
+
+        # Normalize path for patching; prefer relative to workdir when possible.
+        path_raw = op.get("path") or ""
+        rel_path = ""
+        if path_raw:
+            p = Path(path_raw)
+            try:
+                rel_path = str(p.relative_to(repo))
+            except Exception:
+                rel_path = p.name if p.name else str(p)
+
+        def _wrap_if_needed(text: str) -> str:
+            """
+            If the diff is missing headers (common with apply_patch_call),
+            wrap it in the cookbook *** Begin Patch / *** Update File format
+            so process_patch can apply it.
+            """
+            stripped = text.lstrip()
+            if stripped.startswith("*** Begin Patch") or stripped.startswith("--- ") or stripped.startswith("diff --git"):
+                return text
+            if rel_path and "@@" in text:
+                return f"*** Begin Patch\n*** Update File: {rel_path}\n{text.rstrip()}\n*** End Patch\n"
+            return text
+
+        diff = _wrap_if_needed(diff_raw)
+
+        if diff.strip().startswith("*** Begin Patch"):
+            try:
+                def open_file(path: str) -> str:
+                    with open(repo / path, "rt", encoding="utf-8") as f:
+                        return f.read()
+
+                def write_file(path: str, content: str) -> None:
+                    tgt = repo / path
+                    tgt.parent.mkdir(parents=True, exist_ok=True)
+                    with open(tgt, "wt", encoding="utf-8") as f:
+                        f.write(content)
+
+                def remove_file(path: str) -> None:
+                    tgt = repo / path
+                    if tgt.exists():
+                        tgt.unlink()
+
+                result = process_patch(diff, open_file, write_file, remove_file)
+                return True, result
+            except DiffError as e:
+                return False, f"Patch failed: {e}"
+            except Exception as e:
+                snippet = diff[:200].replace("\n", "\\n")
+                return False, f"Patch exception: {e}; diff_head={snippet}"
+
+        patch_bin = shutil.which("patch")
+        if not patch_bin:
+            return False, "patch binary not found on PATH"
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as tf:
+                tf.write(diff if diff.endswith("\n") else diff + "\n")
+                tf_path = tf.name
+            proc = subprocess.run(
+                [patch_bin, "-p0", "-i", tf_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            log = (proc.stdout or "") + (proc.stderr or "")
+            os.unlink(tf_path)
+            if proc.returncode != 0:
+                return False, f"patch failed rc={proc.returncode}: {log}"
+            return True, f"patch applied. {log.strip()}"
+        except Exception as e:
+            snippet = diff[:200].replace("\n", "\\n")
+            return False, f"Patch exception: {e}; diff_head={snippet}"
+
     # -------- NEW: relabel_methods (Algorithm 1 “relabel” step) ----------
     def relabel_methods(self, methods_catalog: List[str], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -1633,21 +1443,27 @@ class LLMCandidateGenerator:
         # Fallback: identity mapping
         return [{"canonical": (c.get("method") or "opt").strip(), "existed": ((c.get("method") or "").strip() in catalog)} for c in (candidates or [])]
 
-    def propose(self, kernel: Any, region_summary: Optional[Dict[str, Any]] = None, ncu_summary: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def propose(
+        self,
+        kernel: Any,
+        region_summary: Optional[Dict[str, Any]] = None,
+        ncu_summary: Optional[Dict[str, Any]] = None,
+        workdir_path: Optional[str] = None,
+        source_path: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Main entrypoint:
-
-            result = generator.propose(kernel, region_summary)
+        Main entrypoint.
 
         Returns parsed JSON dict (or None on failure).
         """
         self._lazy_client()
 
-        messages = self._mk_messages(kernel, region_summary, ncu_summary)
+        messages = self._mk_messages(kernel, region_summary, ncu_summary, workdir_path, source_path)
         kernel_key = getattr(kernel, "name", "kernel")
         prev_id: Optional[str] = self.prev_id_by_kernel.get(kernel_key)
 
-        # First call: if there's no previous id, send full context; otherwise continue.
+        logger.debug(f"[LLM] propose start kernel={kernel_key} model={self.model} prev_id={prev_id}")
+
         resp = self._send(
             input_payload=messages if not prev_id else [],
             previous_response_id=prev_id,
@@ -1656,10 +1472,11 @@ class LLMCandidateGenerator:
 
         MAX_TURNS = 8
         for _ in range(MAX_TURNS):
-            tool_calls = extract_tool_calls(resp)
-            if tool_calls:
-                # Execute locally and return tool_result.
-                for tc in tool_calls:
+            fn_calls, patch_calls = extract_function_and_patch_calls(resp)
+
+            if fn_calls:
+                logger.debug(f"[LLM] function_calls detected (count={len(fn_calls)}) for kernel={kernel_key}")
+                for tc in fn_calls:
                     out = self.tool_registry.dispatch(tc["name"], tc.get("arguments") or {})
                     resp = self._send_tool_result(
                         prev_id=resp.id,
@@ -1670,13 +1487,30 @@ class LLMCandidateGenerator:
                     self.prev_id_by_kernel[kernel_key] = resp.id
                 continue
 
-            # No tool calls: attempt to parse final JSON.
+            if patch_calls and self._supports_apply_patch:
+                if not workdir_path:
+                    raise RuntimeError("apply_patch_call received but workdir_path is None")
+
+                for pc in patch_calls:
+                    op = pc["operation"]
+                    call_id = pc["call_id"]
+                    ok, logmsg = self._run_apply_patch_operation(workdir_path=workdir_path, operation=op)
+                    resp = self._send_apply_patch_result(
+                        prev_id=resp.id,
+                        call_id=call_id,
+                        status="completed" if ok else "failed",
+                        log_output=logmsg,
+                    )
+                    self.prev_id_by_kernel[kernel_key] = resp.id
+                continue
+
             raw_text = _collect_text_outputs(resp)
+            logger.debug(f"[LLM] raw_text len={len(raw_text)} for kernel={kernel_key}")
             parsed = _maybe_json(raw_text)
             if isinstance(parsed, dict):
+                logger.debug(f"[LLM] parsed JSON with keys={list(parsed.keys())} for kernel={kernel_key}")
                 return parsed
 
-            # Nudge the model once.
             reminder = [
                 {
                     "role": "user",
@@ -1691,9 +1525,340 @@ class LLMCandidateGenerator:
             resp = self._send(input_payload=reminder, previous_response_id=resp.id)
             self.prev_id_by_kernel[kernel_key] = resp.id
 
-        # If we exit the loop without valid JSON, return None.
+        logger.warning(f"[LLM] propose failed to return JSON for kernel={kernel_key}")
         return None
 
+
+# ----------------------- apply_patch cookbook parser -----------------------
+
+class ActionType(str, Enum):
+    ADD = "add"
+    DELETE = "delete"
+    UPDATE = "update"
+
+
+class FileChange(BaseModel):
+    type: ActionType
+    old_content: Optional[str] = None
+    new_content: Optional[str] = None
+    move_path: Optional[str] = None
+
+
+class Commit(BaseModel):
+    changes: dict[str, FileChange] = Field(default_factory=dict)
+
+
+class Chunk(BaseModel):
+    orig_index: int = -1
+    del_lines: list[str] = Field(default_factory=list)
+    ins_lines: list[str] = Field(default_factory=list)
+
+
+class PatchAction(BaseModel):
+    type: ActionType
+    new_file: Optional[str] = None
+    chunks: list[Chunk] = Field(default_factory=list)
+    move_path: Optional[str] = None
+
+
+class Patch(BaseModel):
+    actions: dict[str, PatchAction] = Field(default_factory=dict)
+
+
+class DiffError(ValueError):
+    pass
+
+
+class Parser(BaseModel):
+    current_files: dict[str, str] = Field(default_factory=dict)
+    lines: list[str] = Field(default_factory=list)
+    index: int = 0
+    patch: Patch = Field(default_factory=Patch)
+    fuzz: int = 0
+
+    def is_done(self, prefixes: Optional[tuple[str, ...]] = None) -> bool:
+        if self.index >= len(self.lines):
+            return True
+        if prefixes and self.lines[self.index].startswith(prefixes):
+            return True
+        return False
+
+    def startswith(self, prefix: Optional[tuple[str, ...]]) -> bool:
+        assert self.index < len(self.lines)
+        return self.lines[self.index].startswith(prefix)
+
+    def read_str(self, prefix: str = "", return_everything: bool = False) -> str:
+        assert self.index < len(self.lines)
+        if self.lines[self.index].startswith(prefix):
+            text = self.lines[self.index] if return_everything else self.lines[self.index][len(prefix):]
+            self.index += 1
+            return text
+        return ""
+
+    def parse(self):
+        while not self.is_done(("*** End Patch",)):
+            path = self.read_str("*** Update File: ")
+            if path:
+                if path in self.patch.actions:
+                    raise DiffError(f"Update File Error: Duplicate Path: {path}")
+                move_to = self.read_str("*** Move to: ")
+                if path not in self.current_files:
+                    raise DiffError(f"Update File Error: Missing File: {path}")
+                text = self.current_files[path]
+                action = self.parse_update_file(text)
+                action.move_path = move_to
+                self.patch.actions[path] = action
+                continue
+            path = self.read_str("*** Delete File: ")
+            if path:
+                if path in self.patch.actions:
+                    raise DiffError(f"Delete File Error: Duplicate Path: {path}")
+                if path not in self.current_files:
+                    raise DiffError(f"Delete File Error: Missing File: {path}")
+                self.patch.actions[path] = PatchAction(type=ActionType.DELETE)
+                continue
+            path = self.read_str("*** Add File: ")
+            if path:
+                if path in self.patch.actions:
+                    raise DiffError(f"Add File Error: Duplicate Path: {path}")
+                self.patch.actions[path] = self.parse_add_file()
+                continue
+            raise DiffError(f"Unknown Line: {self.lines[self.index]}")
+        if not self.startswith(("*** End Patch",)):
+            raise DiffError("Missing End Patch")
+        self.index += 1
+
+    def parse_update_file(self, text: str) -> PatchAction:
+        action = PatchAction(type=ActionType.UPDATE)
+        lines = text.split("\n")
+        index = 0
+        while not self.is_done((
+            "*** End Patch",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Add File:",
+            "*** End of File",
+        )):
+            def_str = self.read_str("@@ ")
+            section_str = ""
+            if not def_str and self.lines[self.index] == "@@":
+                section_str = self.lines[self.index]
+                self.index += 1
+            if not (def_str or section_str or index == 0):
+                raise DiffError(f"Invalid Line:\n{self.lines[self.index]}")
+            if def_str.strip():
+                found = False
+                if not [s for s in lines[:index] if s == def_str]:
+                    for i, s in enumerate(lines[index:], index):
+                        if s == def_str:
+                            index = i + 1
+                            found = True
+                            break
+                if not found and not [s for s in lines[:index] if s.strip() == def_str.strip()]:
+                    for i, s in enumerate(lines[index:], index):
+                        if s.strip() == def_str.strip():
+                            index = i + 1
+                            self.fuzz += 1
+                            found = True
+                            break
+            next_chunk_context, chunks, end_patch_index, eof = peek_next_section(self.lines, self.index)
+            new_index, fuzz = find_context(lines, next_chunk_context, index, eof)
+            if new_index == -1:
+                raise DiffError(f"Invalid Context {index}:\n" + "\n".join(next_chunk_context))
+            self.fuzz += fuzz
+            for ch in chunks:
+                ch.orig_index += new_index
+                action.chunks.append(ch)
+            index = new_index + len(next_chunk_context)
+            self.index = end_patch_index
+        return action
+
+    def parse_add_file(self) -> PatchAction:
+        lines = []
+        while not self.is_done((
+            "*** End Patch",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Add File:",
+        )):
+            s = self.read_str()
+            if not s.startswith("+"):
+                raise DiffError(f"Invalid Add File Line: {s}")
+            s = s[1:]
+            lines.append(s)
+        return PatchAction(type=ActionType.ADD, new_file="\n".join(lines))
+
+
+def find_context_core(lines: list[str], context: list[str], start: int) -> tuple[int, int]:
+    if not context:
+        return start, 0
+    for i in range(start, len(lines)):
+        if lines[i : i + len(context)] == context:
+            return i, 0
+    for i in range(start, len(lines)):
+        if [s.rstrip() for s in lines[i : i + len(context)]] == [s.rstrip() for s in context]:
+            return i, 1
+    for i in range(start, len(lines)):
+        if [s.strip() for s in lines[i : i + len(context)]] == [s.strip() for s in context]:
+            return i, 100
+    return -1, 0
+
+
+def find_context(lines: list[str], context: list[str], start: int, eof: bool) -> tuple[int, int]:
+    if eof:
+        new_index, fuzz = find_context_core(lines, context, len(lines) - len(context))
+        if new_index != -1:
+            return new_index, fuzz
+        new_index, fuzz = find_context_core(lines, context, start)
+        return new_index, fuzz + 10000
+    return find_context_core(lines, context, start)
+
+
+def peek_next_section(lines: list[str], index: int) -> tuple[list[str], list[Chunk], int, bool]:
+    old: list[str] = []
+    del_lines: list[str] = []
+    ins_lines: list[str] = []
+    chunks: list[Chunk] = []
+    mode = "keep"
+    orig_index = index
+    while index < len(lines):
+        s = lines[index]
+        if s.startswith(("@@", "*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:", "*** End of File")):
+            break
+        if s == "***":
+            break
+        elif s.startswith("***"):
+            raise DiffError(f"Invalid Line: {s}")
+        index += 1
+        last_mode = mode
+        if s == "":
+            s = " "
+        if s[0] == "+":
+            mode = "add"
+        elif s[0] == "-":
+            mode = "delete"
+        elif s[0] == " ":
+            mode = "keep"
+        else:
+            raise DiffError(f"Invalid Line: {s}")
+        s = s[1:]
+        if mode == "keep" and last_mode != mode:
+            if ins_lines or del_lines:
+                chunks.append(Chunk(orig_index=len(old) - len(del_lines), del_lines=del_lines, ins_lines=ins_lines))
+            del_lines = []
+            ins_lines = []
+        if mode == "delete":
+            del_lines.append(s)
+            old.append(s)
+        elif mode == "add":
+            ins_lines.append(s)
+        elif mode == "keep":
+            old.append(s)
+    if ins_lines or del_lines:
+        chunks.append(Chunk(orig_index=len(old) - len(del_lines), del_lines=del_lines, ins_lines=ins_lines))
+    if index < len(lines) and lines[index] == "*** End of File":
+        index += 1
+        return old, chunks, index, True
+    if index == orig_index:
+        raise DiffError(f"Nothing in this section - {index=} {lines[index]}")
+    return old, chunks, index, False
+
+
+def text_to_patch(text: str, orig: dict[str, str]) -> tuple[Patch, int]:
+    lines = text.strip().split("\n")
+    if len(lines) < 2 or not lines[0].startswith("*** Begin Patch") or lines[-1] != "*** End Patch":
+        raise DiffError("Invalid patch text")
+    parser = Parser(current_files=orig, lines=lines, index=1)
+    parser.parse()
+    return parser.patch, parser.fuzz
+
+
+def identify_files_needed(text: str) -> list[str]:
+    lines = text.strip().split("\n")
+    result = set()
+    for line in lines:
+        if line.startswith("*** Update File: "):
+            result.add(line[len("*** Update File: ") :])
+        if line.startswith("*** Delete File: "):
+            result.add(line[len("*** Delete File: ") :])
+    return list(result)
+
+
+def _get_updated_file(text: str, action: PatchAction, path: str) -> str:
+    assert action.type == ActionType.UPDATE
+    orig_lines = text.split("\n")
+    dest_lines: list[str] = []
+    orig_index = 0
+    dest_index = 0
+    for chunk in action.chunks:
+        if chunk.orig_index > len(orig_lines):
+            raise DiffError(f"_get_updated_file: {path}: chunk.orig_index {chunk.orig_index} > len(lines) {len(orig_lines)}")
+        if orig_index > chunk.orig_index:
+            raise DiffError(f"_get_updated_file: {path}: orig_index {orig_index} > chunk.orig_index {chunk.orig_index}")
+        dest_lines.extend(orig_lines[orig_index : chunk.orig_index])
+        delta = chunk.orig_index - orig_index
+        orig_index += delta
+        dest_index += delta
+        if chunk.ins_lines:
+            dest_lines.extend(chunk.ins_lines)
+            dest_index += len(chunk.ins_lines)
+        orig_index += len(chunk.del_lines)
+    dest_lines.extend(orig_lines[orig_index:])
+    delta = len(orig_lines) - orig_index
+    orig_index += delta
+    dest_index += delta
+    assert orig_index == len(orig_lines)
+    assert dest_index == len(dest_lines)
+    return "\n".join(dest_lines)
+
+
+def patch_to_commit(patch: Patch, orig: dict[str, str]) -> Commit:
+    commit = Commit()
+    for path, action in patch.actions.items():
+        if action.type == ActionType.DELETE:
+            commit.changes[path] = FileChange(type=ActionType.DELETE, old_content=orig[path])
+        elif action.type == ActionType.ADD:
+            commit.changes[path] = FileChange(type=ActionType.ADD, new_content=action.new_file)
+        elif action.type == ActionType.UPDATE:
+            new_content = _get_updated_file(text=orig[path], action=action, path=path)
+            commit.changes[path] = FileChange(
+                type=ActionType.UPDATE,
+                old_content=orig[path],
+                new_content=new_content,
+                move_path=action.move_path,
+            )
+    return commit
+
+
+def load_files(paths: list[str], open_fn: Callable) -> dict[str, str]:
+    orig = {}
+    for path in paths:
+        orig[path] = open_fn(path)
+    return orig
+
+
+def apply_commit(commit: Commit, write_fn: Callable, remove_fn: Callable) -> None:
+    for path, change in commit.changes.items():
+        if change.type == ActionType.DELETE:
+            remove_fn(path)
+        elif change.type == ActionType.ADD:
+            write_fn(path, change.new_content)
+        elif change.type == ActionType.UPDATE:
+            if change.move_path:
+                write_fn(change.move_path, change.new_content)
+                remove_fn(path)
+            else:
+                write_fn(path, change.new_content)
+
+
+def process_patch(text: str, open_fn: Callable, write_fn: Callable, remove_fn: Callable) -> str:
+    assert text.startswith("*** Begin Patch")
+    paths = identify_files_needed(text)
+    orig = load_files(paths, open_fn)
+    patch, _ = text_to_patch(text, orig)
+    commit = patch_to_commit(patch, orig)
+    apply_commit(commit, write_fn, remove_fn)
+    return "apply_patch completed"
 
 # ---------------------------------------------------------------------------
 # Example usage (skeleton)

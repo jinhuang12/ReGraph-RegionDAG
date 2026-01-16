@@ -1,0 +1,373 @@
+{
+  "name": "mixed_sparse_attention",
+  "kernel": {
+    "kernel_type": "triton",
+    "metadata": {
+      "kernel_name": "_triton_mixed_sparse_attn_fwd_kernel",
+      "description": "Mixed sparse attention forward kernel with block-sparse and column-sparse patterns"
+    },
+    "source_code": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef _triton_mixed_sparse_attn_fwd_kernel(\n    Q, K, V, seqlens, sm_scale,\n    block_count, block_offset, column_count, column_index,\n    Out,\n    stride_qz, stride_qh, stride_qm, stride_qk,\n    stride_kz, stride_kh, stride_kn, stride_kk,\n    stride_vz, stride_vh, stride_vn, stride_vk,\n    stride_oz, stride_oh, stride_om, stride_ok,\n    Z, H, N_CTX,\n    NUM_ROWS, NNZ_S, NNZ_V,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n    BLOCK_DMODEL: tl.constexpr,\n    dtype: tl.constexpr,\n):\n    start_m = tl.program_id(0)\n    off_hz = tl.program_id(1)\n\n    seqlen = tl.load(seqlens + off_hz // H)\n    if start_m * BLOCK_M >= seqlen:\n        return\n\n    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    offs_n = tl.arange(0, BLOCK_N)\n    offs_d = tl.arange(0, BLOCK_DMODEL)\n\n    qo_offset = (off_hz // H) * stride_qz + (off_hz % H) * stride_qh\n    kv_offset = (off_hz // H) * stride_kz + (off_hz % H) * stride_kh\n\n    q_ptrs = Q + qo_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk\n    k_ptrs = K + kv_offset + offs_d[:, None] * stride_kk\n    v_ptrs = V + kv_offset + offs_d[None, :] * stride_vk\n    o_ptrs = Out + qo_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok\n\n    num_blks = tl.load(block_count + off_hz * NUM_ROWS + start_m)\n    blks_ptr = block_offset + (off_hz * NUM_ROWS + start_m) * NNZ_S\n    num_cols = tl.load(column_count + off_hz * NUM_ROWS + start_m)\n    cols_ptr = column_index + (off_hz * NUM_ROWS + start_m) * NNZ_V\n\n    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float(\"inf\")\n    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)\n    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)\n    qk_scale = sm_scale * 1.44269504\n    q = tl.load(q_ptrs)\n    q = (q * qk_scale).to(dtype)\n\n    m_mask = offs_m[:, None] < seqlen\n\n    max_num_blks = 8\n    for block_index in range(max_num_blks):\n        cond = block_index < num_blks\n        start_n = tl.load(blks_ptr + block_index, mask=cond)\n        cols = start_n + offs_n\n        n_mask = (cols < seqlen) & cond[:, None]\n        k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)\n        v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)\n        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)\n        causal_mask = (cols[None, :] <= offs_m[:, None])\n        qk = tl.where(m_mask & causal_mask, qk, float(\"-inf\"))\n        qk += tl.dot(q, k)\n        m_i_new = tl.maximum(m_i, tl.max(qk, 1))\n        alpha = tl.math.exp2(m_i - m_i_new)\n        p = tl.math.exp2(qk - m_i_new[:, None])\n        acc_scale = l_i * 0 + alpha\n        acc *= acc_scale[:, None]\n        acc += tl.dot(p.to(dtype), v)\n        l_i = l_i * alpha + tl.sum(p, 1)\n        m_i = m_i_new\n\n    max_num_cols = 16\n    for start_n in range(0, max_num_cols, BLOCK_N):\n        cond = start_n < num_cols\n        n_mask = (start_n + offs_n < num_cols) & cond\n        cols = tl.load(cols_ptr + start_n + offs_n, mask=cond[:, None], other=0)\n        k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)\n        v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)\n        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)\n        qk = tl.where(m_mask & n_mask, qk, float(\"-inf\"))\n        qk += tl.dot(q, k)\n        m_i_new = tl.maximum(m_i, tl.max(qk, 1))\n        alpha = tl.math.exp2(m_i - m_i_new)\n        p = tl.math.exp2(qk - m_i_new[:, None])\n        acc_scale = l_i * 0 + alpha\n        acc *= acc_scale[:, None]\n        acc += tl.dot(p.to(dtype), v)\n        l_i = l_i * alpha + tl.sum(p, 1)\n        m_i = m_i_new\n\n    acc /= l_i[:, None]\n    tl.store(o_ptrs, acc.to(dtype), mask=m_mask)",
+    "io": {
+      "args": [
+        {
+          "name": "Q",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              128,
+              64
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "mean": 0.0,
+              "std": 1.0,
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "K",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              128,
+              64
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "mean": 0.0,
+              "std": 1.0,
+              "seed": 43
+            }
+          }
+        },
+        {
+          "name": "V",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              128,
+              64
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "randn",
+              "mean": 0.0,
+              "std": 1.0,
+              "seed": 44
+            }
+          }
+        },
+        {
+          "name": "seqlens",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "full",
+              "fill_value": 128
+            }
+          }
+        },
+        {
+          "name": "sm_scale",
+          "type": "float",
+          "value": 0.1,
+          "role": "input"
+        },
+        {
+          "name": "block_count",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              2
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "full",
+              "fill_value": 2
+            }
+          }
+        },
+        {
+          "name": "block_offset",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              2,
+              4
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "arange",
+              "start": 0,
+              "step": 32
+            }
+          }
+        },
+        {
+          "name": "column_count",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              2
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "full",
+              "fill_value": 8
+            }
+          }
+        },
+        {
+          "name": "column_index",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              2,
+              8
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "arange",
+              "start": 0,
+              "step": 1
+            }
+          }
+        },
+        {
+          "name": "Out",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              128,
+              64
+            ],
+            "dtype": "float16",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "stride_qz",
+          "type": "int",
+          "value": 32768,
+          "role": "input"
+        },
+        {
+          "name": "stride_qh",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_qm",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "stride_qk",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "stride_kz",
+          "type": "int",
+          "value": 32768,
+          "role": "input"
+        },
+        {
+          "name": "stride_kh",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_kn",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "stride_kk",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "stride_vz",
+          "type": "int",
+          "value": 32768,
+          "role": "input"
+        },
+        {
+          "name": "stride_vh",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_vn",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "stride_vk",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "stride_oz",
+          "type": "int",
+          "value": 32768,
+          "role": "input"
+        },
+        {
+          "name": "stride_oh",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_om",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "stride_ok",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "Z",
+          "type": "int",
+          "value": 2,
+          "role": "input"
+        },
+        {
+          "name": "H",
+          "type": "int",
+          "value": 4,
+          "role": "input"
+        },
+        {
+          "name": "N_CTX",
+          "type": "int",
+          "value": 128,
+          "role": "input"
+        },
+        {
+          "name": "NUM_ROWS",
+          "type": "int",
+          "value": 2,
+          "role": "input"
+        },
+        {
+          "name": "NNZ_S",
+          "type": "int",
+          "value": 4,
+          "role": "input"
+        },
+        {
+          "name": "NNZ_V",
+          "type": "int",
+          "value": 8,
+          "role": "input"
+        },
+        {
+          "name": "BLOCK_M",
+          "type": "int",
+          "value": 64,
+          "is_meta": true,
+          "role": "input"
+        },
+        {
+          "name": "BLOCK_N",
+          "type": "int",
+          "value": 64,
+          "is_meta": true,
+          "role": "input"
+        },
+        {
+          "name": "BLOCK_DMODEL",
+          "type": "int",
+          "value": 64,
+          "is_meta": true,
+          "role": "input"
+        },
+        {
+          "name": "dtype",
+          "type": "str",
+          "value": "tl.float16",
+          "is_meta": true,
+          "role": "input"
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 2,
+          "y": 8,
+          "z": 1
+        },
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    }
+  },
+  "num_trials": 50,
+  "timeout": 180,
+  "description": "Mixed sparse attention kernel with block-sparse and column-sparse patterns for efficient attention computation",
+  "notes": [
+    "Kernel implements mixed sparse attention with both block-sparse and column-sparse patterns",
+    "Grid x dimension: cdiv(seq_len, BLOCK_M) = cdiv(128, 64) = 2",
+    "Grid y dimension: batch_size * num_heads = 2 * 4 = 8",
+    "NUM_ROWS = cdiv(seq_len, BLOCK_M) = 2",
+    "NNZ_S = 4 (number of sparse blocks per row)",
+    "NNZ_V = 8 (number of sparse columns per row)",
+    "Strides calculated for contiguous 4D tensors with shape [2, 4, 128, 64]"
+  ],
+  "_metadata": {
+    "generated_at": "2025-11-24T13:36:50.396577",
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "source_file": "src/IronFist/src/benchmark/data/TritonBench/code/mixed_sparse_attention.py",
+    "fixed_at": "2025-11-24T15:17:39.436220",
+    "fix_reason": "Replaced invalid random sparse patterns with valid deterministic patterns"
+  }
+}

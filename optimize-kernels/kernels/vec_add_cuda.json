@@ -1,0 +1,62 @@
+{
+  "name": "vec_add_cuda",
+  "kernel": {
+    "kernel_type": "cuda",
+    "source_code": "#include <cuda_runtime.h>\nextern \"C\" __global__ void vec_add(const float* a, const float* b, float* c, int n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < n) { c[idx] = a[idx] + b[idx]; }\n}\n",
+    "io": {
+      "args": [
+        {
+          "name": "a",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": { "kind": "randn", "seed": 1 }
+          }
+        },
+        {
+          "name": "b",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": { "kind": "randn", "seed": 2 }
+          }
+        },
+        {
+          "name": "c",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32"
+          }
+        },
+        { "name": "n", "type": "int", "role": "input", "value": 1024 }
+      ],
+      "launch": {
+        "grid": { "x": 4, "y": 1, "z": 1 },
+        "block": { "x": 256, "y": 1, "z": 1 }
+      }
+    },
+    "metadata": {
+      "kernel_name": "vec_add",
+      "reference": {
+        "module": "reference.vec_add_ref",
+        "function": "reference",
+        "rtol": 1e-4,
+        "atol": 1e-6
+      }
+    }
+  },
+  "device_profile": {
+    "gpu_name": "Generic",
+    "arch": "sm_90",
+    "sms": 132,
+    "regs_per_sm": 65536,
+    "smem_per_sm": 228000,
+    "hbm_bw_gbps": 4800
+  }
+}

@@ -27,6 +27,7 @@ import dataclasses
 from enum import Enum
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -45,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from workers.state_manager import save_partial_state, load_partial_state, get_latest_phase_data
 from shared.model import DeviceProfile, KernelCode, _round_float_values, get_metadata_value
 # --- Tools (LLM + Region-DAG + NCU) ---
+import kernel_opt_tooling
 from kernel_opt_tooling import LLMCandidateGenerator, RegionDagContext, NcuMetricsContext, PtxSourceCorrelator
 
 # --------------------------- Constants & Config --------------------------
@@ -55,6 +57,14 @@ EPSILON_SELECT    = 0.05    # tiny exploration in selection
 EPSILON_ROLLOUT   = 0.10    # ε for ε-greedy rollout
 LAMBDA_REG        = 0.50    # λ for Q(s,a) - λ N(s,a)
 ROLLOUT_MAX_STEPS = 4       # rollout horizon cap
+
+# Metric-aware reward blending (Phase 1)
+REWARD_METRIC_PENALTY_WEIGHT = float(os.environ.get("REWARD_METRIC_PENALTY_WEIGHT", "0.15"))
+METRIC_PENALTY_KEYS = [
+    ("dram__bytes_read.sum", 1e-12),   # scale to TB
+    ("dram__bytes_write.sum", 1e-12),
+    ("sm__warps_active.avg.pct_of_peak_sustained_active", -0.01),  # negative weight because higher is better (invert sign below)
+]
 
 # Node identity: use worker's state_hash as node id (graph with transpositions)
 USE_HASH_FOR_NODE_ID = True
@@ -69,6 +79,27 @@ RELABLER_STRICT_JSON_INSTR = (
     "Return STRICT JSON only as an array of objects. Each object must be:\n"
     '{"index": <int>, "existed": "yes"|"no", "method": "<canonical_or_original>"}\n'
 )
+
+# ------------------------------ Logging ------------------------------------
+logging.basicConfig(
+    level=os.environ.get("KERNEL_OPT_LOGLEVEL", "INFO"),
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    force=True,
+)
+logger = logging.getLogger(__name__)
+# Ensure root logger honors env even if configured elsewhere
+try:
+    _lvl_str = os.environ.get("KERNEL_OPT_LOGLEVEL", "INFO").upper()
+    _lvl = logging._nameToLevel.get(_lvl_str, logging.INFO)
+    logging.getLogger().setLevel(_lvl)
+    logger.setLevel(_lvl)
+    for _h in logging.getLogger().handlers:
+        try:
+            _h.setLevel(_lvl)
+        except Exception:
+            pass
+except Exception:
+    pass
 
 # ------------------------- Utility / Filesystem -------------------------
 def sha256_bytes(b: bytes) -> str:
@@ -105,6 +136,61 @@ def indent(s: str, n: int) -> str:
 def arch_sm_to_int(arch: str) -> int:
     m = re.search(r"sm_(\d+)", arch or "")
     return int(m.group(1)) if m else 0
+
+def find_ncu_cli() -> Optional[str]:
+    """
+    Locate Nsight Compute CLI.
+    Order:
+      1) Env override NSIGHT_COMPUTE_CLI (if present on PATH)
+      2) 'ncu'
+      3) 'nv-nsight-cu-cli'
+    """
+    override = os.environ.get("NSIGHT_COMPUTE_CLI")
+    if override:
+        path = shutil.which(override)
+        if path:
+            return path
+    for name in ("ncu", "nv-nsight-cu-cli"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+def load_ncu_metrics(report_path: Optional[str], device_profile: Optional[DeviceProfile] = None) -> Optional[Dict[str, Any]]:
+    """
+    Parse a .ncu-rep (or .nsight-cuprof-report) into a compact metrics dict.
+    Returns None if unavailable. Includes:
+      - raw values for METRIC_PENALTY_KEYS (if present),
+      - "summary" from NcuMetricsContext.summary() when possible.
+    """
+    if not report_path:
+        return None
+    rp = Path(report_path)
+    if not rp.exists():
+        return None
+    try:
+        ctx = NcuMetricsContext(str(rp), range_idx=0, action_idx=0, device_profile=device_profile)
+    except Exception:
+        return None
+
+    metrics: Dict[str, Any] = {}
+    try:
+        metrics["summary"] = ctx.summary()
+    except Exception:
+        pass
+
+    try:
+        requested = [k for k, _ in METRIC_PENALTY_KEYS]
+        res = ctx.get_values(requested, name_kind="ncu")
+        for item in res.get("results", []):
+            name = item.get("ncu_name") or item.get("requested")
+            if name is None:
+                continue
+            metrics[name] = item.get("value")
+    except Exception:
+        pass
+
+    return metrics if metrics else None
 
 # --------------------------- Subprocess Helper ---------------------------
 def run_subprocess(cmd: List[str], cwd: Optional[Path]=None, env: Optional[Dict[str,str]]=None, timeout: Optional[int]=None) -> Tuple[int, str, str]:
@@ -350,6 +436,28 @@ class Orchestrator:
         else:
             self.regraph = self.rgds.load_regraph()
 
+    # --------- Metric-aware penalty (Phase 1) ----------
+    def metric_penalty(self, ncu_metrics: Dict[str, Any]) -> float:
+        """
+        Compute a soft penalty from selected Nsight metrics.
+        Positive value reduces reward. Negative weights (via METRIC_PENALTY_KEYS)
+        invert the sign when higher is better.
+        """
+        penalty = 0.0
+        for key, scale in METRIC_PENALTY_KEYS:
+            val = None
+            if isinstance(ncu_metrics, dict):
+                if key in ncu_metrics:
+                    val = ncu_metrics[key]
+                elif "summary" in ncu_metrics and isinstance(ncu_metrics["summary"], dict):
+                    val = ncu_metrics["summary"].get(key)
+            try:
+                if val is not None:
+                    penalty += float(val) * scale
+            except Exception:
+                continue
+        return max(0.0, penalty)
+
     def load_kernel_specs(self) -> List[KernelCode]:
         p = Path(self.args.input)
         specs: List[KernelCode] = []
@@ -421,7 +529,9 @@ class Orchestrator:
                 ncu=run.get("ncu_metrics", {"kernel_time_ms": run.get("mean_ms", 0.0)}),
                 edges={}, actions={}, applied_actions=[], applied_methods=[],
                 last_method="START",
-                impl_hash=worker_root_hash
+                impl_hash=worker_root_hash,
+                ptx_path=run.get("ptx_path"),
+                ncu_report_path=run.get("ncu_report_path")
             ))},
             "events_path": str(self.kernel_dir(k) / "events.jsonl"),
             "trace_path": str(self.kernel_dir(k) / "trace.md"),
@@ -471,8 +581,10 @@ class Orchestrator:
                 # Progressive widening limit
                 limit = max(1, PW_K0 + int(PW_K1 * (ns.visits ** PW_ALPHA)))
 
-                # If no actions yet -> expand here
+                # If no actions yet -> expand here (seed path with sentinel action)
                 if not ns.edges:
+                    logger.debug(f"[MCGS] Node {s}: no edges yet, seeding path for expansion.")
+                    path.append((s, None))
                     break
 
                 # P-UCB(s): score = Qbar + sqrt(2 ln N / n)
@@ -513,26 +625,55 @@ class Orchestrator:
             leaf_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in leaf_ns.edges.items()}
 
             # ------ Expansion on first visit ------
-            region_summary = {}
-            ncu_summary = {}
+            region_summary: Dict[str, Any] = {}
+            ncu_summary: Dict[str, Any] = {}
             try:
+                rctx: Optional[RegionDagContext] = None
+                nctx: Optional[NcuMetricsContext] = None
+                correlator: Optional[PtxSourceCorrelator] = None
+
                 if leaf_ns.ptx_path and Path(leaf_ns.ptx_path).exists():
-                    rctx = RegionDagContext(Path(leaf_ns.ptx_path).read_text(encoding="utf-8"), kernel_name="kernel")
+                    ptx_text = Path(leaf_ns.ptx_path).read_text(encoding="utf-8")
+                    kernel_name = get_metadata_value(k.metadata, "kernel_name", "kernel")
+                    rctx = RegionDagContext(ptx_text, kernel_name=kernel_name)
                     region_summary = rctx.overview()
+
                 if leaf_ns.ncu_report_path and Path(leaf_ns.ncu_report_path).exists():
-                    nctx = NcuMetricsContext(leaf_ns.ncu_report_path, range_idx=0, action_idx=0)
+                    nctx = NcuMetricsContext(leaf_ns.ncu_report_path, range_idx=0, action_idx=0, device_profile=k.device_profile)
                     ncu_summary = nctx.summary()
+                    correlator = PtxSourceCorrelator(Path(leaf_ns.ncu_report_path))
+
+                kernel_opt_tooling.CURRENT_REGION_DAG_CTX = rctx
+                kernel_opt_tooling.CURRENT_NCU_CTX = nctx
+                kernel_opt_tooling.CURRENT_PTX_CORRELATOR = correlator
             except Exception:
-                pass
+                kernel_opt_tooling.CURRENT_REGION_DAG_CTX = None
+                kernel_opt_tooling.CURRENT_NCU_CTX = None
+                kernel_opt_tooling.CURRENT_PTX_CORRELATOR = None
+                region_summary = {}
+                ncu_summary = {}
 
             if not leaf_ns.edges:
+                logger.debug(f"[MCGS] Expanding leaf_state={leaf_state} (no edges); calling LLM propose.")
                 # Ask LLM for proposals (region/NCU summaries optional)
                 proposals_obj: Optional[Dict[str, Any]] = None
-                try:
-                    proposals_obj = self.llm.propose(k, region_summary=region_summary, ncu_summary=ncu_summary)  # if signature supports it
-                except TypeError:
-                    proposals_obj = self.llm.propose(k, region_summary=region_summary)  # backward-compat
+                workdir = Path(leaf_ns.ptx_path).parent if leaf_ns.ptx_path else (self.kernel_dir(k) / "baseline")
+                self.llm.repo_root = workdir
+
+                source_rel = "kernel_module.py" if str(k.kernel_type).lower().endswith("triton") else "kernel.cu"
+                source_path = workdir / source_rel
+                prompt_kernel = KernelCode.model_validate(k.model_dump())
+                prompt_kernel.source_code = (source_path.read_text(encoding="utf-8") if source_path.exists() else (leaf_ns.source_code or k.source_code))
+
+                proposals_obj = self.llm.propose(
+                    prompt_kernel,
+                    region_summary=region_summary,
+                    ncu_summary=ncu_summary,
+                    workdir_path=str(workdir),
+                    source_path=str(source_path),
+                )
                 if not proposals_obj or not proposals_obj.get("candidates"):
+                    logger.warning(f"[MCGS] Propose returned no candidates at state {leaf_state}. proposals_obj={proposals_obj}")
                     # Count a visit and try another iteration
                     leaf_ns.visits += 1
                     search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
@@ -541,6 +682,7 @@ class Orchestrator:
 
                 # === ReGraphT-style relabel(LLM, τ, O) ===
                 steps = proposals_obj["candidates"]
+                logger.debug(f"[MCGS] Received {len(steps)} candidates before relabel at state {leaf_state}.")
                 steps = relabel_methods(self, search_state, steps)  # >>> CHANGED: unified relabel
 
                 # Offline ReGraph constraint at first expansion
@@ -548,6 +690,7 @@ class Orchestrator:
                 allowed = set(self.regraph.get("edges", {}).get(last_m, {}).keys())
                 if allowed:
                     filtered = [c for c in steps if c.get("method_canonical") in allowed]
+                    logger.debug(f"[MCGS] ReGraph filter from {len(steps)} -> {len(filtered)} using allowed={list(allowed)} at state {leaf_state}.")
                     if filtered:
                         steps = filtered
 
@@ -563,16 +706,27 @@ class Orchestrator:
                     leaf_ns.actions[aid] = c
 
                 # Save node after registering actions
+                logger.debug(f"[MCGS] Registered {len(leaf_ns.actions)} actions at state {leaf_state}.")
                 search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
                 json_dump(search_state, search_state_path)
 
             # Choose one action to materialize now (greedy on Q; ties arbitrary)
             leaf_ns = NodeStats(**search_state["nodes"][leaf_state])
+            leaf_ns.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in leaf_ns.edges.items()}
             if leaf_ns.edges:
                 scored = [((es.Qbar, a)) for a, es in leaf_ns.edges.items()]
                 scored.sort(key=lambda t: t[0], reverse=True)
                 leaf_action = scored[0][1]
                 path[-1] = (leaf_state, leaf_action)
+                logger.debug(f"[MCGS] Chose action {leaf_action} at state {leaf_state} (Qbar={leaf_ns.edges[leaf_action].Qbar}).")
+            else:
+                # No viable actions even after expansion; mark visit and continue
+                logger.warning(f"[MCGS] No actions available after expansion at state {leaf_state}; skipping.")
+                leaf_ns.visits += 1
+                search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
+                json_dump(search_state, search_state_path)
+                budget -= 1
+                continue
 
             chosen = leaf_ns.actions.get(leaf_action, {})
             def _candidate_to_variant(code_text: str, launch_update: Optional[Dict[str,Any]] = None) -> Dict[str, Any]:
@@ -622,6 +776,10 @@ class Orchestrator:
             else:
                 speedup = (baseline_ms / ms) if ms > 0 else 0.0
                 reward = speedup if speedup >= 1.0 else (speedup - 1.0)
+                # Metric-aware penalties (Phase 1)
+                if result.get("ncu_metrics"):
+                    reward -= self.metric_penalty(result["ncu_metrics"])
+            logger.debug(f"[MCGS] Materialized action {leaf_action} -> ok={ok}, reward={reward:.4f}, ms={ms:.4f}, child_id={child_id}.")
 
             # If success, add/merge child node and edge pointer
             if ok and child_id:
@@ -683,12 +841,54 @@ class Orchestrator:
 
                 # First visit? expand all successors
                 if not cur_ns.edges:
+                    # Build contexts + summaries for this node
+                    region_summary = {}
+                    ncu_summary = {}
+                    workdir_roll = Path(cur_ns.ptx_path).parent if cur_ns.ptx_path else (self.kernel_dir(k) / "baseline")
+                    self.llm.repo_root = workdir_roll
+                    try:
+                        rctx: Optional[RegionDagContext] = None
+                        nctx: Optional[NcuMetricsContext] = None
+                        correlator: Optional[PtxSourceCorrelator] = None
+
+                        if cur_ns.ptx_path and Path(cur_ns.ptx_path).exists():
+                            ptx_text = Path(cur_ns.ptx_path).read_text(encoding="utf-8")
+                            kernel_name = get_metadata_value(k.metadata, "kernel_name", "kernel")
+                            rctx = RegionDagContext(ptx_text, kernel_name=kernel_name)
+                            region_summary = rctx.overview()
+
+                        if cur_ns.ncu_report_path and Path(cur_ns.ncu_report_path).exists():
+                            nctx = NcuMetricsContext(cur_ns.ncu_report_path, range_idx=0, action_idx=0, device_profile=k.device_profile)
+                            ncu_summary = nctx.summary()
+                            correlator = PtxSourceCorrelator(Path(cur_ns.ncu_report_path))
+
+                        kernel_opt_tooling.CURRENT_REGION_DAG_CTX = rctx
+                        kernel_opt_tooling.CURRENT_NCU_CTX = nctx
+                        kernel_opt_tooling.CURRENT_PTX_CORRELATOR = correlator
+                    except Exception:
+                        kernel_opt_tooling.CURRENT_REGION_DAG_CTX = None
+                        kernel_opt_tooling.CURRENT_NCU_CTX = None
+                        kernel_opt_tooling.CURRENT_PTX_CORRELATOR = None
+                        region_summary = {}
+                        ncu_summary = {}
+
                     # Ask LLM and relabel
                     props_obj = None
-                    try:
-                        props_obj = self.llm.propose(k, region_summary={}, ncu_summary={})
-                    except TypeError:
-                        props_obj = self.llm.propose(k, region_summary={})
+                    source_rel = "kernel_module.py" if str(k.kernel_type).lower().endswith("triton") else "kernel.cu"
+                    source_path = workdir_roll / source_rel
+                    prompt_kernel = KernelCode.model_validate(k.model_dump())
+                    prompt_kernel.source_code = (source_path.read_text(encoding="utf-8") if source_path.exists() else (cur_ns.source_code or k.source_code))
+
+                    props_obj = self.llm.propose(
+                        prompt_kernel,
+                        region_summary=region_summary,
+                        ncu_summary=ncu_summary,
+                        workdir_path=str(workdir_roll),
+                        source_path=str(source_path),
+                    )
+                    if not props_obj or not props_obj.get("candidates"):
+                        logger.warning(f"[Rollout] Propose returned no candidates at state {cur_state}. props_obj={props_obj}")
+                        break
                     candlist = relabel_methods(self, search_state, props_obj.get("candidates", []) if props_obj else [])
 
                     # ReGraph constraint for rollout node
@@ -696,6 +896,7 @@ class Orchestrator:
                     allowed = set(self.regraph.get("edges", {}).get(last_m, {}).keys())
                     if allowed:
                         filt = [c for c in candlist if c.get("method_canonical") in allowed]
+                        logger.debug(f"[Rollout] ReGraph filter from {len(candlist)} -> {len(filt)} at state {cur_state}.")
                         if filt: candlist = filt
 
                     for c in candlist:
@@ -707,12 +908,14 @@ class Orchestrator:
                     search_state["nodes"][cur_state] = dataclasses.asdict(cur_ns)
                     json_dump(search_state, search_state_path)
                     if not cur_ns.edges:
+                        logger.warning(f"[Rollout] No edges after expansion at state {cur_state}.")
                         break
 
                 # π(a|s): argmax_a [Q - λ N] w.p. 1-ε; else random
                 scored = [((es.Qbar - LAMBDA_REG * es.Nsa), a) for a, es in cur_ns.edges.items()]
                 a_roll = random.choice(list(cur_ns.edges.keys())) if random.random() < EPSILON_ROLLOUT else sorted(scored, reverse=True)[0][1]
                 cand = cur_ns.actions.get(a_roll, {})
+                logger.debug(f"[Rollout] Chose action {a_roll} at state {cur_state} (score={dict(scored).get(a_roll)}).")
 
                 # Materialize rollout step
                 vdir2 = self.kernel_dir(k) / "variants" / str(uuid.uuid4())
@@ -744,6 +947,8 @@ class Orchestrator:
                     ms2 = float(res2.get("mean_ms", 1e9))
                     sp2 = (baseline_ms / ms2) if ms2 > 0 else 0.0
                     r2 = sp2 if sp2 >= 1.0 else (sp2 - 1.0)
+                    if res2.get("ncu_metrics"):
+                        r2 -= self.metric_penalty(res2["ncu_metrics"])
                     # attach next child
                     child2 = res2.get("state_hash")
                     child2 = child2 if USE_HASH_FOR_NODE_ID else str(uuid.uuid4())
@@ -781,6 +986,8 @@ class Orchestrator:
             # ------ Backpropagate max rollout reward ------
             search_state["nodes"][leaf_state] = dataclasses.asdict(leaf_ns)
             for (state_h, action_h) in path:
+                if action_h is None:
+                    continue
                 nsi = NodeStats(**search_state["nodes"][state_h])
                 nsi.edges = {k: v if isinstance(v, EdgeStats) else EdgeStats(**v) for k, v in nsi.edges.items()}
                 esi = nsi.edges[action_h]
@@ -834,6 +1041,10 @@ def worker_main(control_path: str) -> int:
             json_dump({"ok": False, "error": f"unknown kernel_type {k.kernel_type}"}, workdir / "result.json")
             return 1
 
+        reference_cfg = None
+        if isinstance(k.metadata, dict):
+            reference_cfg = k.metadata.get("reference")
+
         target_path = workdir / target_rel
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -866,18 +1077,43 @@ def worker_main(control_path: str) -> int:
                 "launch_update": launch_update,
                 "io_contract": k.io.to_dict() if k.io else {},
                 "timing": timing,
-                "result_path": str((workdir / "runner_result.json").resolve())
+                "result_path": str((workdir / "runner_result.json").resolve()),
+                "ptx_out_path": str((workdir / "kernel.ptx").resolve()),
+                "sass_out_path": str((workdir / "kernel.sass").resolve()),
+                "cubin_out_path": str((workdir / "kernel.cubin").resolve()),
+                "reference": reference_cfg,
             }
             json_dump(runner_config, workdir / "runner_config.json")
 
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
-            rc, out, err = run_subprocess(
-                [sys.executable, "-m", "workers.triton_runner", str((workdir / "runner_config.json").resolve())],
-                cwd=workdir, env=env, timeout=900
-            )
+            runner_cmd = [sys.executable, "-m", "workers.triton_runner", str((workdir / "runner_config.json").resolve())]
+
+            ncu_cfg = control.get("ncu", {}) or {}
+            use_ncu = bool(ncu_cfg.get("enabled", False) and ncu_cfg.get("collect", True))
+            ncu_cli = find_ncu_cli()
+            ncu_report_path = None
+            report_base = "ncu_report"
+
+            if use_ncu and ncu_cli:
+                cmd = [
+                    ncu_cli,
+                    "-f",
+                    "-o", report_base,
+                    "-k", get_metadata_value(k.metadata, "kernel_name", "kernel") or "kernel",
+                ] + runner_cmd
+                rc, out, err = run_subprocess(cmd, cwd=workdir, env=env, timeout=900)
+            else:
+                rc, out, err = run_subprocess(runner_cmd, cwd=workdir, env=env, timeout=900)
+
             write_text(workdir / "runner_stdout.log", out)
             write_text(workdir / "runner_stderr.log", err)
+
+            for ext in (".ncu-rep", ".nsight-cuprof-report"):
+                cand = workdir / f"{report_base}{ext}"
+                if cand.exists():
+                    ncu_report_path = str(cand)
+                    break
 
             if rc != 0 or not (workdir / "runner_result.json").exists():
                 json_dump({"ok": False, "error": "runner failed", "rc": rc}, workdir / "result.json")
@@ -892,20 +1128,19 @@ def worker_main(control_path: str) -> int:
                 "launch_update_applied": r.get("launch_update_applied", False)
             })
 
-            # Placeholders for PTX/SASS until you wire Triton → PTX extraction
             ptx_path = workdir / "kernel.ptx"
-            write_text(ptx_path, "// Triton PTX placeholder")
-            write_text(workdir / "kernel.sass", "// SASS placeholder")
+            ncu_metrics = load_ncu_metrics(ncu_report_path, device_profile=k.device_profile) or {}
+            ncu_metrics["kernel_time_ms"] = float(r.get("mean_ms", 0.0))
             outj = {
                 "ok": bool(r.get("ok", False)),
                 "mean_ms": float(r.get("mean_ms", 1e9)),
                 "std_ms": float(r.get("std_ms", 0.0)),
                 "state_hash": state_hash,
-                "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
+                "ncu_metrics": ncu_metrics,
                 "materialized_source": materialized_source,
                 "launch_update_applied": bool(r.get("launch_update_applied", False)),
-                "ptx_path": str(ptx_path),
-                "ncu_report_path": None
+                "ptx_path": str(ptx_path) if ptx_path.exists() else None,
+                "ncu_report_path": ncu_report_path
             }
             json_dump(outj, workdir / "result.json")
             return 0
@@ -973,17 +1208,42 @@ def worker_main(control_path: str) -> int:
                 "io_contract": effective_io or {},
                 "timing": timing,
                 "result_path": str((workdir / "runner_result.json").resolve())
+                ,
+                "reference": reference_cfg
             }
             json_dump(runner_config, workdir / "runner_config.json")
 
             env = os.environ.copy()
             env['PYTHONPATH'] = str(Path(__file__).parent.resolve())
-            rc, out, err = run_subprocess(
-                [sys.executable, "-m", "workers.cuda_runner", str((workdir / "runner_config.json").resolve())],
-                cwd=workdir, env=env, timeout=900
-            )
+            runner_cmd = [sys.executable, "-m", "workers.cuda_runner", str((workdir / "runner_config.json").resolve())]
+
+            ncu_cfg = control.get("ncu", {}) or {}
+            use_ncu = bool(ncu_cfg.get("enabled", False) and ncu_cfg.get("collect", True))
+            ncu_cli = find_ncu_cli()
+            ncu_report_path = None
+            report_base = "ncu_report"
+
+            if use_ncu and ncu_cli:
+                # Wrap runner with Nsight Compute to capture report
+                cmd = [
+                    ncu_cli,
+                    "-f",  # overwrite existing
+                    "-o", report_base,
+                    "-k", get_metadata_value(k.metadata, "kernel_name", "kernel"),
+                ] + runner_cmd
+                rc, out, err = run_subprocess(cmd, cwd=workdir, env=env, timeout=900)
+            else:
+                rc, out, err = run_subprocess(runner_cmd, cwd=workdir, env=env, timeout=900)
+
             write_text(workdir / "runner_stdout.log", out)
             write_text(workdir / "runner_stderr.log", err)
+
+            # Locate Nsight report if any
+            for ext in (".ncu-rep", ".nsight-cuprof-report"):
+                cand = workdir / f"{report_base}{ext}"
+                if cand.exists():
+                    ncu_report_path = str(cand)
+                    break
 
             if rc != 0 or not (workdir / "runner_result.json").exists():
                 json_dump({"ok": False, "error": "runner failed", "rc": rc}, workdir / "result.json")
@@ -998,15 +1258,17 @@ def worker_main(control_path: str) -> int:
             })
 
             final_state_hash = sha256_str(materialized_source + json.dumps(effective_io or {}, sort_keys=True))
+            ncu_metrics = load_ncu_metrics(ncu_report_path, device_profile=k.device_profile) or {}
+            ncu_metrics["kernel_time_ms"] = float(r.get("mean_ms", 0.0))
             outj = {
                 "ok": bool(r.get("ok", False)),
                 "mean_ms": float(r.get("mean_ms", 1e9)),
                 "std_ms": float(r.get("std_ms", 0.0)),
                 "state_hash": final_state_hash,
-                "ncu_metrics": {"kernel_time_ms": float(r.get("mean_ms", 0.0))},
+                "ncu_metrics": ncu_metrics,
                 "materialized_source": materialized_source,
                 "ptx_path": str(workdir / "kernel.ptx"),
-                "ncu_report_path": None
+                "ncu_report_path": ncu_report_path
             }
             json_dump(outj, workdir / "result.json")
             return 0
@@ -1031,7 +1293,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--outdir", default="out", help="Output directory")
     p.add_argument("--gpus", default="0", help="Comma-separated GPU indices (e.g., 0,1,2)")
     p.add_argument("--budget-builds", type=int, default=20, help="Max rollout builds per kernel")
-    p.add_argument("--llm-model", type=str, default="gpt-5-mini", help="OpenAI Responses model")
+    p.add_argument("--llm-model", type=str, default="gpt-5.1", help="OpenAI Responses model")
     p.add_argument("--resume", action="store_true", help="Resume from existing outdir state")
     p.add_argument("--worker", nargs="?", help="(internal) Worker mode: path to control.json")
     # Offline ReGraph controls

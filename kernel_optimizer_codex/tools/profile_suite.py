@@ -64,27 +64,73 @@ def geomean(values: List[float], weights: List[float]) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", required=True, help="Path to suite JSON")
-    ap.add_argument("--module", default=None, help="Path to kernel module .py (default: kernels/<kernel_name>.py)")
+    ap.add_argument(
+        "--module",
+        default=None,
+        help="Path to kernel module .py (default: kernels/<kernel_name>.py, or kernels/<subdir>/<kernel_name>.py when suite is under suites/<subdir>/)",
+    )
     ap.add_argument("--baseline-module", help="Path to known-good baseline kernel module .py (defaults vary; see below)")
     ap.add_argument("--device", default="cuda:0", help="Device string")
     ap.add_argument("--tag", required=True, help="Tag name for this run (e.g. baseline, meta_001, struct_001)")
     ap.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     ap.add_argument("--iters", type=int, default=100, help="Inner iterations per trial")
     ap.add_argument("--repeat", type=int, default=5, help="Number of timed trials")
+    ap.add_argument(
+        "--backend",
+        default=None,
+        help="Optional backend selector string (passed via _backend / KO_BACKEND to kernels that support it).",
+    )
+    ap.add_argument(
+        "--timing-target",
+        choices=["auto", "benchmark_kernel", "entrypoint"],
+        default="auto",
+        help="What to time: benchmark_kernel (if available) or the entrypoint (default: auto).",
+    )
+    ap.add_argument(
+        "--correctness-mode",
+        choices=["auto", "entrypoint", "seeded_entrypoint", "benchmark_kernel", "skip"],
+        default="auto",
+        help="Correctness strategy (default: auto). seeded_entrypoint is useful for multi_kernel contracts.",
+    )
+    ap.add_argument(
+        "--ncu-call",
+        choices=["auto", "entrypoint", "benchmark_kernel"],
+        default="auto",
+        help="What to run under ncu when using --with-ncu (default: auto).",
+    )
     ap.add_argument("--with-ncu", action="store_true", help="Also run Nsight Compute per contract")
     ap.add_argument("--ncu-bin", default="ncu", help="Nsight Compute CLI binary (default: 'ncu')")
-    ap.add_argument("--timing-mode", choices=["events", "cuda_graphs"], default="events", help="Timing mode to use (default: events)")
+    ap.add_argument(
+        "--ncu-args",
+        default=None,
+        help="Optional raw Nsight Compute args to append when using --with-ncu (e.g. \"--kernel-name <substr>\").",
+    )
+    ap.add_argument(
+        "--timing-mode",
+        choices=["events", "cuda_graphs"],
+        default="cuda_graphs",
+        help="Timing mode to use (default: cuda_graphs)",
+    )
     args = ap.parse_args()
 
     suite_path = Path(args.suite).resolve()
     suite_dir = suite_path.parent
 
+    suites_root: Path | None = None
     repo_root = suite_dir.parent
     # Handle nested suites/<subdir>/ paths by finding the ancestor named "suites"
     for parent in suite_path.parents:
         if parent.name == "suites":
+            suites_root = parent
             repo_root = parent.parent
             break
+    suite_subdir = ""
+    if suites_root is not None:
+        try:
+            rel = suite_dir.relative_to(suites_root)
+            suite_subdir = "" if str(rel) == "." else rel.as_posix()
+        except ValueError:
+            suite_subdir = ""
 
     with suite_path.open("r", encoding="utf-8") as f:
         suite = json.load(f)
@@ -92,13 +138,19 @@ def main() -> int:
     kernel_name = suite["kernel_name"]
     entry_point = suite.get("entry_point", "run")
     contracts_dir_rel = suite.get("contracts_dir", "contracts")
+    # Back-compat: old suites sometimes used "contracts" even when living under suites/<subdir>/.
+    if contracts_dir_rel == "contracts" and suite_subdir:
+        alt_contracts = f"contracts/{suite_subdir}"
+        if (repo_root / alt_contracts).is_dir():
+            contracts_dir_rel = alt_contracts
     objective = suite.get("objective", "geomean_speedup")
 
     contracts_dir = (repo_root / contracts_dir_rel).resolve()
     if args.module:
         module_path = Path(args.module).resolve()
     else:
-        module_path = (repo_root / "kernels" / f"{kernel_name}.py").resolve()
+        module_rel = Path("kernels") / suite_subdir if suite_subdir else Path("kernels")
+        module_path = (repo_root / module_rel / f"{kernel_name}.py").resolve()
 
     baseline_arg = Path(args.baseline_module).resolve() if args.baseline_module else None
 
@@ -166,8 +218,13 @@ def main() -> int:
             iters=args.iters,
             repeat=args.repeat,
             out_dir=case_out_dir,
+            backend=args.backend,
+            timing_target=args.timing_target,
+            correctness_mode=args.correctness_mode,
+            ncu_call=args.ncu_call,
             with_ncu=args.with_ncu,
             ncu_bin=args.ncu_bin,
+            ncu_args=args.ncu_args,
             timing_mode=effective_timing_mode,
         )
 
@@ -236,6 +293,11 @@ def main() -> int:
         "contracts_dir": contracts_dir_rel,
         "tag": tag,
         "device": args.device,
+        "backend": args.backend,
+        "timing_target": args.timing_target,
+        "correctness_mode": args.correctness_mode,
+        "ncu_call": args.ncu_call,
+        "ncu_args": args.ncu_args,
         "timing_mode": effective_timing_mode,
         "timing": {
             "warmup": args.warmup,

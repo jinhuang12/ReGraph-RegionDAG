@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ if not logger.handlers:
 
 from ptx_dag_tool_v2 import build_all, Region, Stage  # type: ignore
 from ptx_source_correlator import PtxSourceCorrelator  # type: ignore
+from shared.model import DeviceProfile
 
 
 class RegionDagContext:
@@ -330,8 +332,237 @@ def _safe_div(n: Optional[float], d: Optional[float]) -> Optional[float]:
 
 
 # -------------------------------
-# Canonical → NCU metric mappings
+# FLOP counting helpers (heuristic)
 # -------------------------------
+#
+# Nsight Compute metric availability varies across versions/sets.
+# In particular, recent Nsight versions commonly omit the raw
+# `smsp__sass_thread_inst_executed_op_*.sum` counters from `--set full`, while
+# keeping the `.sum.per_cycle_elapsed` rates (inst/cycle). We therefore support
+# both:
+#   - direct sum counters when available, and
+#   - reconstructing sums from (inst/cycle) * (cycles elapsed).
+SASS_OP_FLOPS: Dict[str, float] = {
+    # FP32
+    "ffma": 2.0,
+    "fmad": 2.0,
+    "fadd": 1.0,
+    "fmul": 1.0,
+    # FP64
+    "dfma": 2.0,
+    "dadd": 1.0,
+    "dmul": 1.0,
+    # FP16 (scalar)
+    "hfma": 2.0,
+    "hadd": 1.0,
+    "hmul": 1.0,
+}
+
+
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _metric_get(raw_metrics: Dict[str, Any], name: str) -> Optional[float]:
+    return _as_float(raw_metrics.get(name))
+
+
+def _sass_op_count(raw_metrics: Dict[str, Any], op: str) -> float:
+    """
+    Return total thread-op count for a given SASS op kind (e.g., "ffma").
+    Prefers raw `.sum` when present, else reconstructs from `.sum.per_cycle_elapsed`.
+    """
+    # Prefer direct sums if present.
+    for prefix in ("smsp__", "sm__"):
+        direct = _metric_get(raw_metrics, f"{prefix}sass_thread_inst_executed_op_{op}_pred_on.sum")
+        if direct is not None:
+            return max(0.0, direct)
+
+    # Fall back to per-cycle rates.
+    cycles = _metric_get(raw_metrics, "smsp__cycles_elapsed.sum")
+    cycles = cycles if cycles and cycles > 0.0 else _metric_get(raw_metrics, "sm__cycles_elapsed.sum")
+    if not cycles or cycles <= 0.0:
+        return 0.0
+
+    for prefix in ("smsp__", "sm__"):
+        rate = _metric_get(raw_metrics, f"{prefix}sass_thread_inst_executed_op_{op}_pred_on.sum.per_cycle_elapsed")
+        if rate is not None:
+            return max(0.0, rate) * cycles
+    return 0.0
+
+def compute_arithmetic_intensity(raw_metrics: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Compute arithmetic intensity (FLOPs / DRAM byte) from raw Nsight metrics.
+    Uses dram__bytes_read.sum + dram__bytes_write.sum and (best-effort) FLOP counters.
+    """
+    bytes_read = float(raw_metrics.get("dram__bytes_read.sum", 0.0) or 0.0)
+    bytes_write = float(raw_metrics.get("dram__bytes_write.sum", 0.0) or 0.0)
+    dram_bytes = bytes_read + bytes_write
+
+    flops = 0.0
+
+    # 1) Tensor core math ops (already reported as "math ops" counters).
+    # These appear in modern Nsight as:
+    #   sm__ops_path_tensor_src_<src>_dst_<dst>_sparsity_<on/off>.sum
+    # and are generally available under `--set full`.
+    for name, val in raw_metrics.items():
+        if not (name.startswith("sm__ops_path_tensor_src_") and name.endswith(".sum")):
+            continue
+        fv = _as_float(val)
+        if fv is None:
+            continue
+        flops += max(0.0, fv)
+
+    # 2) Scalar FP math ops from SASS op-counters (when available).
+    for op, weight in SASS_OP_FLOPS.items():
+        flops += _sass_op_count(raw_metrics, op) * weight
+
+    if dram_bytes <= 0.0:
+        ai = math.inf if flops > 0 else 0.0
+    else:
+        ai = flops / dram_bytes
+
+    return {
+        "arith_intensity_flop_per_byte": ai,
+        "arith_intensity_flops": flops,
+        "arith_intensity_dram_bytes": dram_bytes,
+    }
+
+def compute_roofline_bound(ai_flop_per_byte: float, device_profile: Optional[DeviceProfile]) -> Dict[str, Any]:
+    """
+    Classify bound type using a simple roofline balance point if device peak FLOPs
+    and memory bandwidth are known.
+    """
+    if not device_profile:
+        return {"roofline_bound": "unknown"}
+
+    peak_flops_tflops = device_profile.peak_flops_tflops
+    mem_bw_gbps = device_profile.mem_bandwidth_gbps or device_profile.hbm_bw_gbps
+
+    if peak_flops_tflops is None or mem_bw_gbps is None or mem_bw_gbps <= 0:
+        return {"roofline_bound": "unknown"}
+
+    I_crit = (peak_flops_tflops * 1e12) / (mem_bw_gbps * 1e9)  # FLOP/byte
+    bound = "unknown"
+    if math.isfinite(ai_flop_per_byte):
+        if ai_flop_per_byte < 0.5 * I_crit:
+            bound = "memory_bound"
+        elif ai_flop_per_byte > 2.0 * I_crit:
+            bound = "compute_bound"
+        else:
+            bound = "balanced"
+    return {"roofline_bound": bound, "roofline_I_crit": I_crit}
+
+
+def _infer_peak_dram_bw_gbps(raw_metrics: Dict[str, Any]) -> Optional[float]:
+    """
+    Infer device peak DRAM bandwidth (GB/s) from Nsight Compute metrics.
+
+    Preferred method (available in recent Nsight versions):
+      peak_bw = dram__bytes.sum.per_second / (gpu__dram_throughput.% / 100)
+    """
+    bytes_sum_per_second = _metric_get(raw_metrics, "dram__bytes.sum.per_second")
+    gpu_dram_pct = _metric_get(raw_metrics, "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed")
+    if bytes_sum_per_second and gpu_dram_pct and gpu_dram_pct > 0.0:
+        return (bytes_sum_per_second / (gpu_dram_pct / 100.0)) / 1e9
+
+    # Fallback: use peak sustained bytes/cycle * DRAM cycles/sec.
+    peak_bytes_per_cycle = _metric_get(raw_metrics, "dram__bytes.sum.peak_sustained")
+    dram_cycles_hz = _metric_get(raw_metrics, "dram__cycles_elapsed.avg.per_second")
+    if peak_bytes_per_cycle and dram_cycles_hz and peak_bytes_per_cycle > 0.0 and dram_cycles_hz > 0.0:
+        return (peak_bytes_per_cycle * dram_cycles_hz) / 1e9
+
+    return None
+
+
+def _infer_peak_flops_tflops(raw_metrics: Dict[str, Any]) -> Optional[float]:
+    """
+    Infer a *kernel-relevant* device peak compute rate (TFLOP/s, best-effort)
+    from Nsight Compute metrics.
+
+    Notes:
+      - For tensor ops, Nsight often provides `sm__ops_path_tensor_src_*.sum.*`
+        counters including `peak_sustained_elapsed.per_second`, which we treat
+        as the peak "math ops" rate for that datatype path.
+      - For scalar ops, we fall back to `sm__sass_thread_inst_executed_op_*`
+        peak sustained (inst/cycle) multiplied by SM frequency.
+      - This is a heuristic; it is intended to provide a consistent
+        roofline balance point for *classification*, not a spec-sheet number.
+    """
+    # Prefer tensor-path peaks if this kernel used any tensor math ops.
+    tensor_ops: List[Tuple[str, float]] = []
+    for name, val in raw_metrics.items():
+        if not (name.startswith("sm__ops_path_tensor_src_") and name.endswith(".sum")):
+            continue
+        fv = _as_float(val)
+        if fv is None or fv <= 0.0:
+            continue
+        tensor_ops.append((name, fv))
+
+    if tensor_ops:
+        # Choose the dominant tensor op path by executed ops.
+        tensor_ops.sort(key=lambda kv: kv[1], reverse=True)
+        dominant_name, _ = tensor_ops[0]
+
+        peak_per_second = _metric_get(raw_metrics, f"{dominant_name}.peak_sustained_elapsed.per_second")
+        if peak_per_second and peak_per_second > 0.0:
+            return peak_per_second / 1e12
+
+        # Fallback: reconstruct peak from achieved rate + pct-of-peak.
+        achieved_per_second = _metric_get(raw_metrics, f"{dominant_name}.per_second")
+        pct = _metric_get(raw_metrics, f"{dominant_name}.pct_of_peak_sustained_elapsed")
+        if achieved_per_second and pct and pct > 0.0:
+            return (achieved_per_second / (pct / 100.0)) / 1e12
+
+    # Scalar fallback: find the dominant scalar op (by counted FLOPs) that also
+    # has a peak sustained metric available.
+    sm_freq_hz = _metric_get(raw_metrics, "sm__cycles_elapsed.avg.per_second")
+    if not sm_freq_hz or sm_freq_hz <= 0.0:
+        sm_freq_hz = _metric_get(raw_metrics, "gpc__cycles_elapsed.avg.per_second")
+
+    if sm_freq_hz and sm_freq_hz > 0.0:
+        candidates: List[Tuple[str, float]] = []
+        for op, weight in SASS_OP_FLOPS.items():
+            # Only consider ops that actually occurred.
+            op_flops = _sass_op_count(raw_metrics, op) * weight
+            if op_flops <= 0.0:
+                continue
+            peak_inst_per_cycle = _metric_get(raw_metrics, f"sm__sass_thread_inst_executed_op_{op}_pred_on.sum.peak_sustained")
+            if peak_inst_per_cycle and peak_inst_per_cycle > 0.0:
+                peak_flops_per_second = peak_inst_per_cycle * sm_freq_hz * weight
+                candidates.append((op, peak_flops_per_second))
+
+        if candidates:
+            # Use the highest peak among used ops (heuristic).
+            peak = max(v for _, v in candidates)
+            if peak > 0.0:
+                return peak / 1e12
+
+    return None
+
+
+def infer_device_profile_from_ncu(raw_metrics: Dict[str, Any]) -> Optional[DeviceProfile]:
+    """
+    Infer a minimal DeviceProfile from metrics embedded in an Nsight Compute report.
+
+    This avoids maintaining a hard-coded table per GPU SKU and captures runtime
+    effects (e.g., clocks) reflected by Nsight's computed peak sustained rates.
+    """
+    mem_bw_gbps = _infer_peak_dram_bw_gbps(raw_metrics)
+    peak_flops_tflops = _infer_peak_flops_tflops(raw_metrics)
+
+    if mem_bw_gbps is None and peak_flops_tflops is None:
+        return None
+
+    return DeviceProfile(
+        peak_flops_tflops=peak_flops_tflops,
+        mem_bandwidth_gbps=mem_bw_gbps,
+    )
 
 CANONICAL_METRIC_SECTIONS: Dict[str, Dict[str, str]] = {
     # High-level Speed-of-Light / throughput
@@ -475,7 +706,7 @@ class NcuMetricsContext:
       - search_names(): substring search over metric names/descriptions.
     """
 
-    def __init__(self, report_path: str, range_idx: int = 0, action_idx: int = 0):
+    def __init__(self, report_path: str, range_idx: int = 0, action_idx: int = 0, device_profile: Optional[DeviceProfile] = None):
         if not NCU_REPORT_AVAILABLE:
             raise RuntimeError("ncu_report is not available; Nsight Compute must be installed.")
 
@@ -484,9 +715,11 @@ class NcuMetricsContext:
         self.range = self.report.range_by_idx(range_idx)
         self.action = self.range.action_by_idx(action_idx)
         self.kernel_name = self.action.name()
+        self.device_profile = device_profile
 
         # Cache all metrics.
         self._metrics: Dict[str, MetricInfo] = self._collect_metrics()
+        self.raw_metrics: Dict[str, Any] = {name: mi.value for name, mi in self._metrics.items()}
 
     def _collect_metrics(self) -> Dict[str, MetricInfo]:
         metrics: Dict[str, MetricInfo] = {}
@@ -527,7 +760,12 @@ class NcuMetricsContext:
               "device_name": str | None,
               "speed_of_light": {...},
               "scheduling": {...},
-              "memory": {...}
+              "memory": {...},
+              "arith_intensity_flop_per_byte": float,
+              "arith_intensity_flops": float,
+              "arith_intensity_dram_bytes": float,
+              "roofline_bound": str,
+              "roofline_I_crit": float | None
             }
         """
         # Helper: read by canonical name
@@ -546,7 +784,12 @@ class NcuMetricsContext:
             if val is None:
                 return None
             u = (unit or "").lower()
-            if "byte" in u and "second" in u or u in ("b/s", "bytes/second"):
+            # Nsight units vary: we commonly see "byte/s", but also "b/s" or "bytes/second".
+            # Treat any bytes-per-second unit as raw B/s and convert to GB/s.
+            if any(tok in u for tok in ("byte/s", "bytes/s", "byte/sec", "bytes/sec", "byte/second", "bytes/second", "b/s")):
+                # Avoid double-scaling if the unit already declares GB/s.
+                if any(tok in u for tok in ("gbyte/s", "gbytes/s", "gb/s", "gbyte/sec", "gb/sec")):
+                    return float(val)
                 return float(val) / 1e9
             return float(val)
 
@@ -579,6 +822,33 @@ class NcuMetricsContext:
                 "l2_throughput_pct": get_canon("l2_throughput_pct"),
             },
         }
+
+        # Arithmetic intensity + roofline
+        try:
+            ai_info = compute_arithmetic_intensity(self.raw_metrics)
+            summary.update(ai_info)
+            dp = self.device_profile
+            dp_source = "provided"
+            if dp is None:
+                dp = infer_device_profile_from_ncu(self.raw_metrics)
+                dp_source = "ncu_inferred" if dp is not None else "unknown"
+
+            if dp is not None:
+                summary["roofline_device_profile"] = {
+                    "peak_flops_tflops": dp.peak_flops_tflops,
+                    "mem_bandwidth_gbps": dp.mem_bandwidth_gbps or dp.hbm_bw_gbps,
+                    "source": dp_source,
+                }
+
+            summary.update(compute_roofline_bound(ai_info["arith_intensity_flop_per_byte"], dp))
+        except Exception:
+            summary.update({
+                "arith_intensity_flop_per_byte": None,
+                "arith_intensity_flops": None,
+                "arith_intensity_dram_bytes": None,
+                "roofline_bound": "unknown",
+                "roofline_I_crit": None,
+            })
         return summary
 
     # ------------------------- Get values (mode = "get_values") -------------------

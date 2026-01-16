@@ -1,0 +1,252 @@
+{
+  "name": "token_attn_llama2",
+  "kernel": {
+    "kernel_type": "triton",
+    "metadata": {
+      "kernel_name": "_fwd_kernel_token_att1",
+      "description": "Token attention kernel for LLaMA2-style attention computation with grouped query attention support"
+    },
+    "source_code": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef _fwd_kernel_token_att1(\n    Q, K, sm_scale, B_Loc, B_Start_Loc, B_Seqlen, max_input_len,\n    Att_Out,\n    stride_b_loc_b, stride_b_loc_s,\n    stride_qb, stride_qh, stride_qs, stride_qd,\n    stride_kb, stride_kh, stride_ks, stride_kd,\n    att_stride_h, att_stride_bs,\n    kv_group_num,\n    BLOCK_DMODEL: tl.constexpr,\n    BLOCK_N: tl.constexpr\n):\n    cur_batch = tl.program_id(0)\n    cur_head = tl.program_id(1)\n    start_n = tl.program_id(2)\n    \n    cur_kv_head = cur_head // kv_group_num\n\n    offs_d = tl.arange(0, BLOCK_DMODEL)\n    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)\n    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)\n\n    cur_batch_start_index = max_input_len - cur_batch_seq_len\n    cur_batch_end_index = max_input_len\n\n    off_q = cur_batch * stride_qb + cur_head * stride_qh + offs_d * stride_qd\n\n    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)\n\n    block_stard_index = start_n * BLOCK_N\n    block_mask = tl.where(block_stard_index < cur_batch_seq_len, 1, 0)\n\n    for start_mark in range(0, block_mask, 1):\n        q = tl.load(Q + off_q + start_mark)\n        offs_n_new = cur_batch_start_index + offs_n\n        k_loc = tl.load(B_Loc + stride_b_loc_b * cur_batch + stride_b_loc_s * offs_n_new, mask=offs_n_new < cur_batch_end_index, other=0)\n        off_k = k_loc[:, None] * stride_ks + cur_kv_head * stride_kh + offs_d[None, :] * stride_kd\n        k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)\n        att_value = tl.sum(q[None, :] * k, 1)\n        att_value *= sm_scale\n        off_o = cur_head * att_stride_h + (cur_batch_in_all_start_index + offs_n) * att_stride_bs\n        tl.store(Att_Out + off_o, att_value, mask=offs_n_new < cur_batch_end_index)\n    return",
+    "io": {
+      "args": [
+        {
+          "name": "Q",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              64,
+              32
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "mean": 0.0,
+              "std": 1.0,
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "K",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              64,
+              32
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "mean": 0.0,
+              "std": 1.0,
+              "seed": 43
+            }
+          }
+        },
+        {
+          "name": "sm_scale",
+          "type": "float",
+          "value": 0.17677669529663687,
+          "role": "input"
+        },
+        {
+          "name": "B_Loc",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2,
+              64
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "uniform",
+              "low": 0,
+              "high": 64,
+              "seed": 44
+            }
+          }
+        },
+        {
+          "name": "B_Start_Loc",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "uniform",
+              "low": 0,
+              "high": 64,
+              "seed": 45
+            }
+          }
+        },
+        {
+          "name": "B_Seqlen",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "init": {
+              "kind": "uniform",
+              "low": 1,
+              "high": 65,
+              "seed": 46
+            }
+          }
+        },
+        {
+          "name": "max_input_len",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "Att_Out",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [
+              2,
+              4,
+              64
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "stride_b_loc_b",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "stride_b_loc_s",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "stride_qb",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_qh",
+          "type": "int",
+          "value": 2048,
+          "role": "input"
+        },
+        {
+          "name": "stride_qs",
+          "type": "int",
+          "value": 32,
+          "role": "input"
+        },
+        {
+          "name": "stride_qd",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "stride_kb",
+          "type": "int",
+          "value": 8192,
+          "role": "input"
+        },
+        {
+          "name": "stride_kh",
+          "type": "int",
+          "value": 2048,
+          "role": "input"
+        },
+        {
+          "name": "stride_ks",
+          "type": "int",
+          "value": 32,
+          "role": "input"
+        },
+        {
+          "name": "stride_kd",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "att_stride_h",
+          "type": "int",
+          "value": 64,
+          "role": "input"
+        },
+        {
+          "name": "att_stride_bs",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "kv_group_num",
+          "type": "int",
+          "value": 1,
+          "role": "input"
+        },
+        {
+          "name": "BLOCK_DMODEL",
+          "type": "int",
+          "value": 32,
+          "is_meta": true,
+          "role": "input"
+        },
+        {
+          "name": "BLOCK_N",
+          "type": "int",
+          "value": 32,
+          "is_meta": true,
+          "role": "input"
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 2,
+          "y": 4,
+          "z": 2
+        },
+        "num_warps": 2,
+        "num_stages": 1
+      }
+    }
+  },
+  "num_trials": 50,
+  "timeout": 180,
+  "description": "Token attention kernel for LLaMA2 with grouped query attention. Computes attention scores between query and key tensors using location-based indexing for efficient memory access patterns.",
+  "notes": [
+    "Grid dimensions: (batch_size, head_num, cdiv(max_input_len, BLOCK_N))",
+    "sm_scale computed as 1.0 / sqrt(d_model)",
+    "Supports grouped query attention via kv_group_num parameter",
+    "Uses location-based indexing (B_Loc) for key tensor access",
+    "BLOCK_DMODEL must be one of {16, 32, 64, 128}",
+    "Stride values computed from tensor shapes for proper memory layout"
+  ],
+  "_metadata": {
+    "generated_at": "2025-11-24T13:52:38.619440",
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "source_file": "src/IronFist/src/benchmark/data/TritonBench/code/token_attn_llama2.py"
+  }
+}

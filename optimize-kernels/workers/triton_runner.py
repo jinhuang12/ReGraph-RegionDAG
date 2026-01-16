@@ -195,6 +195,11 @@ def run_kernel_io_contract_mode(
     timing = config["timing"]
     launch_update = config.get("launch_update", {})
     io_contract = config.get("io_contract", {})
+    ptx_out_path = config.get("ptx_out_path")
+    sass_out_path = config.get("sass_out_path")
+    cubin_out_path = config.get("cubin_out_path")
+    reference_cfg = config.get("reference")
+    reference_cfg = config.get("reference")
 
     try:
         module, _ = load_kernel_module(kernel_path)
@@ -306,19 +311,120 @@ def run_kernel_io_contract_mode(
         print(f"Error during kernel execution: {error_msg}", file=sys.stderr)
         print(error_tb, file=sys.stderr)
 
+    # Aggregate with additional robustness stats
     mean_ms = float(sum(times) / len(times)) if times else float("inf")
     std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5) if times else 0.0
+    min_ms = float(min(times)) if times else float("inf")
+    median_ms = float(sorted(times)[len(times)//2]) if times else float("inf")
+
+    # Try to dump PTX if Triton exposed it
+    ptx_path = None
+    asm_obj = getattr(jit_func, "asm", None)
+    if asm_obj and isinstance(asm_obj, dict):
+        # PTX
+        if ptx_out_path:
+            try:
+                if "ptx" in asm_obj and asm_obj["ptx"]:
+                    p = Path(ptx_out_path)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(asm_obj["ptx"], encoding="utf-8")
+                    ptx_path = str(p)
+            except Exception:
+                pass
+        # SASS (if available)
+        if sass_out_path:
+            try:
+                sass = asm_obj.get("sass")
+                if sass:
+                    p = Path(sass_out_path)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(str(sass), encoding="utf-8")
+            except Exception:
+                pass
+        # CUBIN binary (if present)
+        if cubin_out_path:
+            try:
+                cubin = asm_obj.get("cubin")
+                if cubin:
+                    p = Path(cubin_out_path)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    data = cubin if isinstance(cubin, (bytes, bytearray)) else str(cubin).encode("utf-8")
+                    p.write_bytes(data)
+            except Exception:
+                pass
+
+    # Optional correctness check against Python reference
+    correctness_error = None
+    if ok and reference_cfg:
+        try:
+            import importlib.util
+            import numpy as np
+
+            ref_mod_path = reference_cfg.get("module")
+            ref_func_name = reference_cfg.get("function", "reference")
+            rtol = float(reference_cfg.get("rtol", 1e-3))
+            atol = float(reference_cfg.get("atol", 1e-4))
+
+            if ref_mod_path:
+                if Path(ref_mod_path).exists():
+                    spec = importlib.util.spec_from_file_location("ref_mod", ref_mod_path)
+                    ref_mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(ref_mod)  # type: ignore
+                else:
+                    ref_mod = importlib.import_module(ref_mod_path)
+            else:
+                ref_mod = None
+
+            ref_fn = getattr(ref_mod, ref_func_name) if ref_mod else None
+            if ref_fn is None:
+                raise RuntimeError("reference function not found")
+
+            np_inputs = []
+            for a, spec in zip(inputs, io_contract_obj.args):
+                if spec.type == "tensor":
+                    np_inputs.append(a.detach().cpu().numpy())
+                else:
+                    np_inputs.append(a)
+
+            ref_out = ref_fn(*np_inputs)
+            if isinstance(ref_out, tuple) or isinstance(ref_out, list):
+                ref_outputs = list(ref_out)
+            elif ref_out is None:
+                ref_outputs = []
+            else:
+                ref_outputs = [ref_out]
+
+            gpu_out_np = []
+            for a, spec in zip(inputs, io_contract_obj.args):
+                if spec.role in ("output", "inout"):
+                    gpu_out_np.append(a.detach().cpu().numpy())
+
+            if len(ref_outputs) != len(gpu_out_np):
+                raise RuntimeError(f"reference returned {len(ref_outputs)} outputs, expected {len(gpu_out_np)}")
+            for exp, got in zip(ref_outputs, gpu_out_np):
+                if not np.allclose(exp, got, rtol=rtol, atol=atol, equal_nan=False):
+                    ok = False
+                    correctness_error = "reference_mismatch"
+                    break
+        except Exception as e:
+            ok = False
+            correctness_error = f"reference_failed: {e}"
 
     result = {
         "ok": bool(ok),
         "mean_ms": mean_ms,
         "std_ms": std_ms,
-        "launch_update_applied": True
+        "min_ms": min_ms,
+        "median_ms": median_ms,
+        "launch_update_applied": True,
+        "ptx_path": ptx_path,
     }
 
     if error_msg:
         result["error"] = error_msg
         result["traceback"] = error_tb
+    if correctness_error:
+        result["error"] = correctness_error
 
     return result
 
@@ -340,6 +446,9 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
     invocation = config.get("invocation_example", "")
     timing = config["timing"]
     launch_update = config.get("launch_update", {})
+    ptx_out_path = config.get("ptx_out_path")
+    sass_out_path = config.get("sass_out_path")
+    cubin_out_path = config.get("cubin_out_path")
 
     if not invocation:
         return {
@@ -411,14 +520,42 @@ def run_kernel_legacy_mode(config: Dict[str, Any]) -> Dict[str, Any]:
         ok = False
         times = [float("inf")]
 
-    mean_ms = float(sum(times) / len(times))
-    std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5)
+    mean_ms = float(sum(times) / len(times)) if times else float("inf")
+    std_ms = float((sum((x - mean_ms) ** 2 for x in times) / len(times)) ** 0.5) if times else 0.0
+    min_ms = float(min(times)) if times else float("inf")
+    median_ms = float(sorted(times)[len(times)//2]) if times else float("inf")
+
+    ptx_path = None
+    if ptx_out_path or sass_out_path or cubin_out_path:
+        try:
+            # Legacy invocation may have left a jit_func in module; attempt to find any compiled kernels
+            for _, func in find_triton_kernels(module):
+                asm_obj = getattr(func, "asm", None)
+                if asm_obj and isinstance(asm_obj, dict):
+                    if ptx_out_path and asm_obj.get("ptx"):
+                        p = Path(ptx_out_path); p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(asm_obj["ptx"], encoding="utf-8")
+                        ptx_path = str(p)
+                    if sass_out_path and asm_obj.get("sass"):
+                        p = Path(sass_out_path); p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(str(asm_obj["sass"]), encoding="utf-8")
+                    if cubin_out_path and asm_obj.get("cubin"):
+                        p = Path(cubin_out_path); p.parent.mkdir(parents=True, exist_ok=True)
+                        data = asm_obj["cubin"]
+                        data = data if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+                        p.write_bytes(data)
+                    break
+        except Exception:
+            pass
 
     return {
         "ok": bool(ok),
         "mean_ms": mean_ms,
         "std_ms": std_ms,
-        "launch_update_applied": bool(uses_update)
+        "min_ms": min_ms,
+        "median_ms": median_ms,
+        "launch_update_applied": bool(uses_update),
+        "ptx_path": ptx_path
     }
 
 
